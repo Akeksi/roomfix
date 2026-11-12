@@ -16,6 +16,8 @@ TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".s
 class App:
     def __init__(self, demo=False):
         self.demo = demo
+        if demo:
+            engine.WINDOWS = False  # demo never touches the real audio engine
         self.cfg = config.demo() if demo else config.load()
         self.meas = self.verify_irs = self.design = None
         self.design_version = 0
