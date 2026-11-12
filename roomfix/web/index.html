@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>roomfix</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>roomfix</h1>
+  <span id="demo" class="chip" hidden>Demo: simulated speakers</span>
+  <span id="engine" class="chip"></span>
+</header>
+<main>
+  <details id="setup" class="card">
+    <summary><h2>1 · Setup</h2><span id="setup-summary" class="muted"></span></summary>
+    <div class="grid">
+      <label>DAC<select id="output_device"></select></label>
+      <label>Measurement microphone<select id="input_device"></select></label>
+      <label>Mic input channel<input id="input_channel" type="number" min="1" max="64"></label>
+      <label>Mic calibration file
+        <span class="row"><button id="cal-btn" type="button">Choose file</button>
+        <span id="cal-name" class="muted"></span></span>
+        <input id="cal-file" type="file" accept=".txt,.cal,.frd,.csv" hidden></label>
+      <label>Playback engine<select id="backend">
+        <option value="camilladsp">CamillaDSP (required for active crossovers)</option>
+        <option value="equalizerapo">Equalizer APO</option></select></label>
+      <label id="capture-wrap">System audio source<select id="capture_device"></select></label>
+      <label>Microphone positions<input id="positions" type="number" min="1" max="9"></label>
+      <label>Loudest allowed test signal (dBFS)<input id="max_level_db" type="number" min="-60" max="0" step="1"></label>
+      <label class="check"><input id="autostart" type="checkbox"> Start correction with Windows</label>
+    </div>
+    <h3>Speakers</h3>
+    <div class="row">
+      <label class="inline">Type<select id="n_ways">
+        <option value="1">Passive / full range (1 DAC channel each)</option>
+        <option value="2">Active 2-way</option>
+        <option value="3">Active 3-way</option></select></label>
+      <button id="add-speaker" type="button">Add speaker</button>
+    </div>
+    <table id="speakers"></table>
+    <div id="xo-setup"></div>
+    <ul id="errors" class="errors"></ul>
+  </details>
+
+  <section class="card">
+    <h2>2 · Measure</h2>
+    <p class="muted">Put the microphone at ear height in the listening position, pointing at the ceiling. Stay quiet during the sweeps.</p>
+    <div class="row">
+      <button id="run" class="primary" type="button">Measure and correct</button>
+      <label class="check"><input id="auto_apply" type="checkbox" checked> Apply when finished</label>
+      <button id="identify" type="button">Check wiring</button>
+      <button id="cancel" type="button" hidden>Stop</button>
+    </div>
+    <div id="job" hidden>
+      <div class="bar"><div id="bar"></div></div>
+      <div id="job-msg" class="now"></div>
+      <div id="prompt" class="prompt" hidden>
+        <p id="prompt-msg"></p>
+        <button id="prompt-yes" class="primary" type="button">Continue</button>
+        <button id="prompt-no" type="button">Cancel</button>
+      </div>
+    </div>
+    <p id="job-result" class="result" hidden></p>
+  </section>
+
+  <section id="result" class="card" hidden>
+    <h2>3 · Result</h2>
+    <div class="row">
+      <button id="apply" class="primary" type="button">Apply correction</button>
+      <button id="bypass" type="button">Turn correction off</button>
+      <button id="verify" type="button">Measure result again</button>
+      <span id="apply-msg" class="muted"></span>
+    </div>
+    <ul id="warnings" class="errors"></ul>
+    <div id="charts"></div>
+    <h3>Target curve</h3>
+    <div class="grid">
+      <label>Preset<select id="preset">
+        <option value="">Custom</option>
+        <option value="0,0">Flat</option>
+        <option value="-0.5,0">Slight downward tilt</option>
+        <option value="-0.8,3">Balanced</option>
+        <option value="-1,6">Warm</option></select></label>
+      <label>Tilt <output id="tilt-o"></output><input id="tilt" type="range" min="-2" max="1" step="0.1"></label>
+      <label>Bass boost <output id="bass_boost-o"></output><input id="bass_boost" type="range" min="-3" max="10" step="0.5"></label>
+      <label>Bass boost below <output id="bass_freq-o"></output><input id="bass_freq" type="range" min="40" max="300" step="5"></label>
+      <label>Max boost <output id="max_boost-o"></output><input id="max_boost" type="range" min="0" max="12" step="0.5"></label>
+      <label>Max cut <output id="max_cut-o"></output><input id="max_cut" type="range" min="0" max="24" step="1"></label>
+      <label>Filters per speaker <output id="n_filters-o"></output><input id="n_filters" type="range" min="1" max="20" step="1"></label>
+      <label>Correct from (Hz, empty = auto)<input id="f_min" type="number" min="10" max="20000"></label>
+      <label>Correct up to (Hz, empty = auto)<input id="f_max" type="number" min="10" max="20000"></label>
+    </div>
+    <details><summary>Custom curve</summary>
+      <p class="muted">One "frequency dB" pair per line, added on top of the settings above. Example: <code>3000 -2</code>.
+        <button id="points-file-btn" type="button">Load file</button><input id="points-file" type="file" hidden></p>
+      <textarea id="points" rows="5" spellcheck="false"></textarea>
+    </details>
+    <h3>Applied settings</h3>
+    <div id="summary"></div>
+  </section>
+</main>
+<div id="tip" class="tip" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

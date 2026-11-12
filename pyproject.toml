@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roomfix"
+description = "Fully automatic speaker and room correction: measure, compute, apply."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "sounddevice>=0.4.6", "pyyaml>=6"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+roomfix = "roomfix.__main__:main"
+
+[tool.setuptools]
+packages = ["roomfix"]
+
+[tool.setuptools.package-data]
+roomfix = ["web/*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "roomfix.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
