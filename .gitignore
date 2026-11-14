@@ -1,6 +1,19 @@
+# Python
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.venv/
+venv/
+
+# Build output (PyInstaller)
 build/
 dist/
 *.spec
+
+# Local tooling and data that must never be pushed
+.claude/
+*.log
+*.npz
+settings.json
+camilladsp.exe
+camilladsp.yml

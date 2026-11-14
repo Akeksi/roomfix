@@ -1,6 +1,7 @@
 """Real audio I/O through sounddevice (WASAPI on Windows)."""
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -41,6 +42,7 @@ class Audio:
         if self.in_ch >= self.inp["channels"]:
             raise RuntimeError("The selected microphone input channel does not exist.")
         self.exclusive = sys.platform == "win32"
+        self._last_play = -1e9
 
     @staticmethod
     def _find(devs, name, what):
@@ -51,6 +53,27 @@ class Audio:
 
     def playrec(self, out, extra=1.0):
         """Play `out` [samples, channels] on the DAC, return the mono mic recording."""
+        com = None
+        if sys.platform == "win32":
+            # WASAPI streams only start on a thread that has COM initialised; the
+            # measurement runs on a worker thread, where nobody has done that yet.
+            import ctypes
+            com = ctypes.windll.ole32
+            if com.CoInitializeEx(None, 0) < 0:  # e.g. thread already uses another COM mode
+                com = None
+        try:
+            # A DAC or HDMI link that was idle, or was just released by the playback
+            # engine, can swallow the first half second. Wake it with silence first.
+            if time.monotonic() - self._last_play > 5:
+                self._try(np.zeros((int(0.6 * self.fs), out.shape[1])), 0.0)
+            rec = self._try(out, extra)
+            self._last_play = time.monotonic()
+            return rec
+        finally:
+            if com:
+                com.CoUninitialize()
+
+    def _try(self, out, extra):
         try:
             return self._playrec(out, extra, self.exclusive)
         except _sd().PortAudioError:
@@ -87,9 +110,14 @@ class Audio:
             outdata[n:] = 0
             pos["out"] += n
 
-        extra_out = sd.WasapiSettings(exclusive=True) if exclusive else None
+        extra_in = extra_out = None
+        if sys.platform == "win32":
+            # Raw mode bypasses the Windows audio effects. Without it, microphone noise
+            # suppression gates the test signals and output enhancements colour them.
+            extra_in, extra_out = sd.WasapiSettings(), sd.WasapiSettings(exclusive=exclusive)
+            extra_in._streaminfo.streamOption = extra_out._streaminfo.streamOption = 1  # eStreamOptionRaw
         with sd.InputStream(device=self.inp["index"], channels=self.in_ch + 1, samplerate=fs,
-                            dtype="float32", callback=on_input), \
+                            dtype="float32", callback=on_input, extra_settings=extra_in), \
              sd.OutputStream(device=self.out["index"], channels=n_out, samplerate=fs,
                              dtype="float32", callback=on_output, extra_settings=extra_out):
             if not done.wait(len(rec) / fs + 10):

@@ -135,18 +135,58 @@ def _download():
         _exe().write_bytes(archive.read("camilladsp.exe"))
 
 
+def _own_processes(access=0x1000):
+    """Open handles of the CamillaDSP processes started from roomfix's own copy.
+
+    Other CamillaDSP installations on the computer are never touched. The caller
+    closes the handles. access: PROCESS_QUERY_LIMITED_INFORMATION by default.
+    """
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                               ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    pids = (wintypes.DWORD * 16384)()
+    used = wintypes.DWORD()
+    if not k32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(used)):
+        return k32, []
+    own = os.path.normcase(os.path.realpath(_exe()))
+    handles = []
+    for pid in pids[:used.value // ctypes.sizeof(wintypes.DWORD)]:
+        handle = k32.OpenProcess(access | 0x1000, False, pid)
+        if not handle:
+            continue
+        buf, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+        if (k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+                and os.path.normcase(os.path.realpath(buf.value)) == own):
+            handles.append(handle)
+        else:
+            k32.CloseHandle(handle)
+    return k32, handles
+
+
 def camilla_running():
     if not WINDOWS:
         return False
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq camilladsp.exe", "/NH"],
-                         capture_output=True, text=True, creationflags=0x08000000).stdout
-    return "camilladsp.exe" in out.lower()
+    k32, handles = _own_processes()
+    for handle in handles:
+        k32.CloseHandle(handle)
+    return bool(handles)
 
 
 def camilla_stop():
-    if WINDOWS and camilla_running():
-        subprocess.run(["taskkill", "/F", "/IM", "camilladsp.exe"], capture_output=True, creationflags=0x08000000)
-        time.sleep(0.5)
+    if not WINDOWS:
+        return
+    k32, handles = _own_processes(0x0001 | 0x00100000)  # PROCESS_TERMINATE | SYNCHRONIZE
+    for handle in handles:
+        k32.TerminateProcess(handle, 1)
+        k32.WaitForSingleObject(handle, 5000)
+        k32.CloseHandle(handle)
+    if handles:
+        time.sleep(0.5)  # let Windows release the audio device
 
 
 def camilla_start():
