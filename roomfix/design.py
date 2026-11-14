@@ -4,13 +4,19 @@ The result ("design") fully describes the processing per speaker:
 
     input -> eq (peaking filters) -> gain -> per way: crossover -> gain/polarity -> delay -> DAC channel
 
+A subwoofer is one more, shared way below all speakers: every speaker is
+high-passed at the subwoofer crossover and the subwoofer plays the low-passed
+sum of them, level-matched, delayed and with the polarity that makes it add up
+with the speakers. It may sit on another output device with another latency.
+
 `render` runs a signal through exactly this chain, `export` writes it out for
 CamillaDSP or Equalizer APO.
 """
 import numpy as np
+from scipy import signal
 from scipy.optimize import least_squares
 
-from . import dsp
+from . import config, dsp
 from .measure import PRE, protect_response
 
 NFFT = 1 << 16
@@ -20,6 +26,8 @@ GRID = dsp.log_grid(20.0, 20000.0, 24)
 # ---- processing chain ----------------------------------------------------
 def crossover_filters(cfg, wi):
     xo, n, out = cfg["crossover"], len(cfg["ways"]), []
+    if wi == 0 and config.sub(cfg):
+        out += dsp.linkwitz_riley("Highpass", float(config.sub(cfg)["crossover"]), "LR4")
     if wi > 0:
         out += dsp.linkwitz_riley("Highpass", xo["freqs"][wi - 1], xo["slope"])
     if wi < n - 1:
@@ -36,6 +44,14 @@ def render(spk, x, fs):
         d = way["delay"]
         out[d:, wi] = z[:len(z) - d]
     return out
+
+
+def render_sub(design, si, x, fs):
+    """What the subwoofer plays of speaker si's input signal x."""
+    spk, sub = design["speakers"][si], design["sub"]
+    y = dsp.apply(spk["eq"], fs, x) * 10 ** ((spk["gain"] + sub["gains"][si]) / 20) * (-1 if sub["invert"] else 1)
+    y = dsp.apply(sub["filters"], fs, y)
+    return np.concatenate([np.zeros(sub["delay"]), y[:len(y) - sub["delay"]]])
 
 
 def way_response(way, fs, f):
@@ -229,7 +245,7 @@ def design(cfg, meas, cal=None, verify_irs=None):
                 inverts = [not x for x in inverts]
                 notes.append(f"{spk['name']} is connected with reversed polarity; this is corrected digitally.")
         work.append(dict(fine=fine, coarse=coarse, f_lo=float(f_lo), f_hi=float(f_hi), offset=offset,
-                         arrival=arrival, drv_db=drv_db, xo=xo, gains=gains))
+                         arrival=arrival, drv_db=drv_db, xo=xo, gains=gains, total=total))
         speakers.append({
             "name": spk["name"], "input": spk["input"], "eq": [], "gain": 0.0,
             "ways": [{"name": ways[wi]["name"], "channel": spk["channels"][wi],
@@ -240,12 +256,51 @@ def design(cfg, meas, cal=None, verify_irs=None):
     # speakers: equal level and equal arrival time at the microphone
     common = min(w["offset"] for w in work)
     latest = max(w["arrival"] for w in work)
+    for spk, w in zip(speakers, work):
+        spk["delay"] = int(round(latest - w["arrival"]))
+
+    # subwoofer: level, delay and polarity against all speakers playing together
+    sub, wait = None, 0
+    if config.sub(cfg):
+        fc = float(config.sub(cfg)["crossover"])
+        lp = dsp.linkwitz_riley("Lowpass", fc, "LR4")
+        h_lp = dsp.response(lp, fs, f)
+        offsets = meas.get("offsets", {}).get("sub") or [0.0] * len(meas["irs"]["sub"])
+        hs = [np.fft.rfft(ir, NFFT) / mic * np.exp(-2j * np.pi * f * off / fs)
+              for ir, off in zip(meas["irs"]["sub"], offsets)]
+        sub_db = _smooth_db(f, np.mean([np.abs(h) ** 2 for h in hs], axis=0), 1 / 6)
+        sub_offset = _mean_db(sub_db - shape, fc / 2.5, fc)
+        upper = sum(w["total"][0] * np.exp(-2j * np.pi * f * spk["delay"] / fs) * 10 ** ((common - w["offset"]) / 20)
+                    for spk, w in zip(speakers, work))
+        lower = hs[0] * h_lp * 10 ** ((common - sub_offset) / 20) * len(speakers)
+        # the devices may be far apart in time: find the bulk delay first, then the exact one
+        band = (f > fc / 2) & (f < fc * 2)
+        cross = np.zeros(len(f), complex)
+        cross[band] = lower[band] * np.conj(upper[band])
+        k = int(np.argmax(np.abs(signal.hilbert(np.fft.irfft(cross, NFFT)))))
+        bulk = k if k < NFFT // 2 else k - NFFT
+        d, flip = align(lower * np.exp(2j * np.pi * f * bulk / fs), upper, f, fs, fc)
+        late = bulk + d  # > 0: the subwoofer arrives later, so the speakers must wait for it
+        wait = max(late, 0)
+        sub = {"name": "Subwoofer", "channel": config.sub(cfg)["channel"], "device": config.sub_device(cfg),
+               "filters": lp, "gains": [round(w["offset"] - sub_offset, 1) for w in work],
+               "invert": bool(flip), "delay": int(max(-late, 0))}
+        if sub["delay"] > 0.25 * fs or wait > 0.25 * fs:
+            notes.append("The delay between the output devices is unusually long; sound will lag behind video.")
+        for spk, w, gain in zip(speakers, work, sub["gains"]):
+            rel = sub["delay"] - spk["delay"] - wait
+            term = [h * h_lp * 10 ** (gain / 20) * (-1 if flip else 1) * np.exp(-2j * np.pi * f * rel / fs) for h in hs]
+            power = np.mean([np.abs(t + b) ** 2 for t, b in zip(w["total"], term)], axis=0)
+            w["bass"] = {"speaker": w["fine"], "sub": _smooth_db(f, np.mean([np.abs(b) ** 2 for b in term], axis=0), FINE)}
+            w["fine"], w["coarse"] = _smooth_db(f, power, FINE), _smooth_db(f, power, 1 / 2)
+            third, wide = _smooth_db(f, power, 1 / 3), _smooth_db(f, power, 1.0)
+            ok = np.where(wide > np.median(third[(GRID >= 200) & (GRID <= 5000)]) - 6)[0]
+            w["f_lo"] = float(tgt["f_min"] or GRID[ok[0]])
+
     curves, eq_peak = [], 0.0
     for spk, w in zip(speakers, work):
-        spk_delay = int(round(latest - w["arrival"]))
         for way in spk["ways"]:
-            way["delay"] += spk_delay
-        spk["delay"] = spk_delay
+            way["delay"] += spk["delay"] + wait
         want_fine = shape + w["offset"] - w["fine"]
         want_coarse = shape + w["offset"] - w["coarse"]
         # cut peaks precisely, but fill only broad dips (narrow dips are cancellations)
@@ -261,6 +316,13 @@ def design(cfg, meas, cal=None, verify_irs=None):
         w["trim"] = common - w["offset"]
         eq_peak = max(eq_peak, float(np.max(w["eq_db"])) + w["trim"])
     headroom = max(eq_peak, 0.0)  # keep the digital signal from clipping
+    if sub:  # the subwoofer adds up all speakers' bass
+        summed = float(dsp.db(sum(10 ** ((np.max(w["eq_db"]) + w["trim"] + g) / 20)
+                                  for w, g in zip(work, sub["gains"]))))
+        if summed > headroom + 3:
+            notes.append(f"The subwoofer needs a high digital level, which costs {summed - headroom:.0f} dB of "
+                         "overall volume. Turn up the subwoofer's own volume and measure again.")
+        headroom = max(headroom, summed)
     for si, (spk, w) in enumerate(zip(speakers, work)):
         spk["gain"] = round(w["trim"] - headroom, 1)
         c = {
@@ -276,13 +338,20 @@ def design(cfg, meas, cal=None, verify_irs=None):
                 rawc = np.where(GRID >= low, w["drv_db"][wi] - common, np.nan)
                 c["drivers"].append({"name": way["name"], "raw": rawc,
                                      "filtered": rawc + dsp.db(dsp.response(way["filters"], fs, GRID)) + way["gain"]})
+        if sub:
+            c["bass"] = {k: v - common for k, v in w["bass"].items()}
         if verify_irs is not None and si < len(verify_irs):
             h = np.fft.rfft(verify_irs[si], NFFT) / mic
             c["verified"] = _smooth_db(f, np.abs(h) ** 2, FINE) - common + headroom
             win = np.clip(np.minimum(np.log2(f / 350) / 0.5, np.log2(11000 / f) / 0.5), 0, 1)
             c["verified_arrival_ms"] = round((dsp.envelope_peak(np.fft.irfft(h * win, NFFT)) / fs - PRE) * 1000, 3)
+            if sub and sub["device"]:
+                # measured through the system audio path: neither its volume nor its latency is known
+                mid = (GRID >= 200) & (GRID <= 5000)
+                c["verified"] += float(np.mean((c["predicted"] - c["verified"])[mid]))
+                c["verified_arrival_ms"] = None
         curves.append(c)
-    return {"fs": fs, "speakers": speakers, "curves": curves, "freq": GRID, "target": shape,
+    return {"fs": fs, "speakers": speakers, "sub": sub, "curves": curves, "freq": GRID, "target": shape,
             "headroom": round(headroom, 1), "warnings": meas.get("warnings", []) + notes}
 
 

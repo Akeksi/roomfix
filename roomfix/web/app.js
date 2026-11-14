@@ -59,6 +59,16 @@ function renderSetup() {
     el("tr", {}, el("th", { textContent: "Name" }), el("th", { textContent: "Plays" }),
       ...cfg.ways.map((w) => el("th", { textContent: w.name })), el("th")), ...rows);
 
+  const sub = cfg.sub;
+  $("#sub_enabled").checked = sub.enabled;
+  for (const e of document.querySelectorAll(".sub-opt")) e.hidden = !sub.enabled;
+  options($("#sub_device"), [["", "The same DAC"], ...outs.filter((d) => d.name !== cfg.output_device).map((d) => [d.name, d.name])], sub.device);
+  const subCh = (outs.find((d) => d.name === (sub.device || cfg.output_device)) || { channels: 8 }).channels;
+  options($("#sub_channel"), Array.from({ length: Math.max(subCh, sub.channel + 1) }, (_, c) => [String(c), "Channel " + (c + 1)]), String(sub.channel));
+  $("#sub_crossover").value = sub.crossover;
+  $("#sub_max").value = sub.max_level_db ?? "";
+  $("#sub-note").hidden = !(sub.enabled && sub.device);
+
   const xo = $("#xo-setup");
   xo.replaceChildren();
   if (cfg.ways.length > 1) {
@@ -113,6 +123,16 @@ function bindSetup() {
     cfg.capture_loopback = kind === "loop"; cfg.capture_device = name.join(":"); save();
   };
   $("#n_ways").onchange = (e) => { setWays(+e.target.value); save(true); };
+  $("#sub_enabled").onchange = (e) => {
+    cfg.sub.enabled = e.target.checked;
+    if (cfg.sub.enabled) cfg.backend = "camilladsp";
+    if (cfg.sub.enabled && !cfg.sub.device) cfg.sub.channel = Math.max(...cfg.speakers.flatMap((s) => s.channels)) + 1;
+    save(true);
+  };
+  $("#sub_device").onchange = (e) => { cfg.sub.device = e.target.value; cfg.sub.channel = 0; $("#sub_enabled").onchange({ target: { checked: true } }); };
+  $("#sub_channel").onchange = (e) => { cfg.sub.channel = +e.target.value; save(); };
+  $("#sub_crossover").onchange = (e) => { cfg.sub.crossover = +e.target.value; save(); };
+  $("#sub_max").onchange = (e) => { cfg.sub.max_level_db = e.target.value === "" ? null : +e.target.value; save(); };
   $("#add-speaker").onclick = () => {
     const used = cfg.speakers.flatMap((s) => s.channels), next = used.length ? Math.max(...used) + 1 : 0;
     cfg.speakers.push({ name: "Speaker " + (cfg.speakers.length + 1), input: cfg.speakers.length % 2,
@@ -245,6 +265,10 @@ function renderResult() {
       charts.append(chart(`${c.name}: crossover (dB)`, D.freq, series));
     }
   }
+  for (const c of D.curves) if (c.bass) charts.append(chart(`${c.name}: subwoofer crossover (dB)`, D.freq, [
+    { name: "Subwoofer", color: "var(--s1)", data: c.bass.sub },
+    { name: "Speaker", color: "var(--s2)", data: c.bass.speaker },
+    { name: "Sum", color: "var(--ink)", data: c.measured, width: 1.5 }]));
   $("#warnings").replaceChildren(...D.warnings.map((w) => el("li", { textContent: w })));
 
   const ms = (n) => ((n / D.fs) * 1000).toFixed(2) + " ms";
@@ -255,6 +279,12 @@ function renderResult() {
     el("td", { className: "num", textContent: (s.gain + w.gain).toFixed(1) + " dB" }),
     el("td", { className: "num", textContent: `${ms(w.delay)} (${((w.delay / D.fs) * 34300).toFixed(1)} cm)` }),
     el("td", { textContent: w.invert ? "inverted" : "normal" }))));
+  if (D.sub) rows.push(el("tr", {},
+    el("td", { textContent: D.sub.name }), el("td", { textContent: D.sub.device || "" }),
+    el("td", { className: "num", textContent: D.sub.channel + 1 }),
+    el("td", { className: "num", textContent: D.sub.gains.map((g, i) => (D.speakers[i].gain + g).toFixed(1)).join(" / ") + " dB" }),
+    el("td", { className: "num", textContent: ms(D.sub.delay) }),
+    el("td", { textContent: D.sub.invert ? "inverted" : "normal" })));
   const eq = D.speakers.map((s) => el("details", {}, el("summary", { textContent: `${s.name}: ${s.eq.length} EQ filters` }),
     el("div", { className: "scroll" }, el("table", {}, el("tr", {}, ...["Frequency", "Gain", "Q"].map((h) => el("th", { textContent: h }))),
       ...s.eq.map((f) => el("tr", {}, el("td", { className: "num", textContent: f.freq + " Hz" }),
@@ -272,7 +302,8 @@ function update(state) {
   $("#engine").className = "chip" + (S.engine === "on" ? " on" : "");
   $("#errors").replaceChildren(...S.errors.map((e) => el("li", { textContent: e })));
   $("#setup-summary").textContent = S.errors.length ? "needs attention"
-    : `${S.cfg.speakers.length} × ${S.cfg.ways.length}-way on ${S.cfg.output_device}`;
+    : `${S.cfg.speakers.length} × ${S.cfg.ways.length}-way on ${S.cfg.output_device}`
+      + (S.cfg.sub.enabled ? ` + subwoofer${S.cfg.sub.device ? " on " + S.cfg.sub.device : ""}` : "");
   for (const id of ["run", "identify", "apply", "verify"]) $("#" + id).disabled = busy || S.errors.length > 0;
   $("#cancel").hidden = !busy;
   $("#job").hidden = !busy;

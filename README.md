@@ -8,6 +8,10 @@ your speakers, computes the correction and applies it to everything you play.
 - **Time alignment** of speakers, and of the drivers inside each speaker.
 - **Active 2-way and 3-way crossovers** on a multichannel DAC (e.g. Topping
   DM7), with driver protection built in.
+- **Subwoofer** with bass management, level, delay and polarity set
+  automatically, even when it hangs on a **different output device** than the
+  speakers (say, speakers on the TV over HDMI and the subwoofer on a USB DAC).
+  The delay between the two devices is measured and compensated.
 - Needs only a DAC and a measurement microphone (calibration file supported).
 
 ![roomfix result page: before, after and target curves](docs/screenshot.png)
@@ -42,6 +46,28 @@ No hardware at hand? `roomfix --demo` runs everything against simulated speakers
 Using several microphone positions (Setup) makes the correction valid for a
 wider listening area.
 
+## Subwoofer and a second output device
+
+Tick **Use a subwoofer** in Setup and say where it is connected: a free channel
+of the DAC, or another output device. Every speaker is then high-passed at the
+subwoofer crossover and the subwoofer plays the bass of all of them.
+
+Two output devices never have the same latency (an HDMI TV is easily 70 ms
+slower than a USB DAC), so music played to both arrives out of step. roomfix
+runs one playback engine per device, plays a timing chirp to a speaker and a
+sweep to the subwoofer through the system audio path, exactly as music will
+travel, and delays the faster device by the difference. Afterwards it measures
+each speaker together with the subwoofer through the running engines.
+
+- The subwoofer has its own "loudest allowed test signal", because its
+  amplifier is separate from the speakers'.
+- After measuring, leave the Windows volume of both output devices and the
+  volume controls of TV, amplifier and subwoofer where they are: they set the
+  balance between speakers and subwoofer. Listen louder or quieter with the
+  Windows volume of the virtual cable (the normal volume keys).
+- After the engines start (at login, or when you press Apply), the devices
+  need up to a minute to settle into exact alignment.
+
 ## Active crossovers and driver safety
 
 For each driver above the woofer you enter its **lowest safe crossover
@@ -69,6 +95,8 @@ each tweeter is cheap insurance.
 | Measure | Log sine sweep per driver. A short chirp from one reference driver precedes each sweep, giving exact relative timing without a loopback cable. |
 | Crossover | Linkwitz-Riley 12/24/48 dB/oct. Driver levels are matched; delay and polarity are chosen so the drivers sum in phase at the crossover. |
 | Speakers | Delay and level are set so all speakers arrive together and equally loud. A speaker wired in reverse is detected and fixed. |
+| Subwoofer | Linkwitz-Riley 24 dB/oct against all speakers. Level matched to the speakers; delay and polarity chosen so that it adds up with them at the crossover. |
+| Two devices | The latency of a CamillaDSP engine is its chunk plus its buffer level; all engines are held at the same level. The remaining difference between the devices is measured through the engines and removed with a delay. |
 | EQ | Up to 20 peaking filters per speaker. Peaks are cut precisely; only broad dips are filled; boost is limited; nothing is corrected outside the speaker's range. |
 | Apply | Written as a CamillaDSP or Equalizer APO configuration. Exported filters are tested against the built-in simulation to be identical. |
 
@@ -76,7 +104,8 @@ Settings and measurements are stored in `%APPDATA%\roomfix`.
 
 ## Limits
 
-- Stereo or multi-speaker setups with 1 to 3 ways each; no subwoofer bass management yet.
+- Stereo or multi-speaker setups with 1 to 3 ways each, plus one subwoofer.
+- Only the subwoofer can be on a second output device, and it needs the CamillaDSP engine.
 - 48 kHz processing, minimum-phase (IIR) correction.
 
 ## Development

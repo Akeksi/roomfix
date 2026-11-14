@@ -69,3 +69,4 @@ svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nu
 .tip i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 6px; }
 .tip span { float: right; margin-left: 14px; color: var(--ink); }
 .tip div { color: var(--ink2); }
+[hidden] { display: none !important; }

@@ -36,12 +36,13 @@ class Audio:
     def __init__(self, cfg):
         self.fs = cfg["sample_rate"]
         devs = list_devices()
+        self.cfg, self.outputs = cfg, devs["outputs"]
         self.out = self._find(devs["outputs"], cfg["output_device"], "DAC")
         self.inp = self._find(devs["inputs"], cfg["input_device"], "microphone")
         self.in_ch = cfg["input_channel"]
         if self.in_ch >= self.inp["channels"]:
             raise RuntimeError("The selected microphone input channel does not exist.")
-        self.exclusive = sys.platform == "win32"
+        self.exclusive = {}  # per output device: False once it has refused exclusive mode
         self._last_play = -1e9
 
     @staticmethod
@@ -51,8 +52,48 @@ class Audio:
                 return dev
         raise RuntimeError(f"The {what} '{name}' was not found. Is it connected and selected in Setup?")
 
-    def playrec(self, out, extra=1.0):
-        """Play `out` [samples, channels] on the DAC, return the mono mic recording."""
+    def device_channels(self):
+        return {d["name"]: d["channels"] for d in self.outputs}
+
+    def system_output(self):
+        """The output device that feeds the system audio source: where Windows plays music."""
+        name = self.cfg["capture_device"]
+        if not self.cfg["capture_loopback"]:
+            twin = name.replace("Output", "Input", 1)  # VB-CABLE: "CABLE Output" records "CABLE Input"
+            if twin == name or twin not in [d["name"] for d in self.outputs]:
+                sd = _sd()
+                api = next(a for a in sd.query_hostapis() if "WASAPI" in a["name"])
+                twin = sd.query_devices(api["default_output_device"])["name"]
+            name = twin
+        used = {self.cfg["output_device"], (self.cfg.get("sub") or {}).get("device")}
+        if name in used:
+            raise RuntimeError("The system audio source must be a virtual cable, not one of the output devices.")
+        return name
+
+    def system_playrec(self, configs, outs, extra=1.0, settle=False):
+        """Play each of `outs` as system audio through engines running `configs`.
+
+        Returns the recordings and each engine's playback buffer level during the first one.
+        """
+        from . import engine
+        name = self.system_output()
+        with engine.session(configs) as engines:
+            if settle:
+                engines.settle()
+            recs, levels = [], None
+            for out in outs:
+                before = engines.buffers()
+                recs.append(self.playrec(out, extra, name))
+                after = engines.buffers()
+                if levels is None:
+                    levels = {dev: None if None in (before[dev], after[dev]) else (before[dev] + after[dev]) / 2
+                              for dev in before}
+        return recs, levels
+
+    def playrec(self, out, extra=1.0, device=None):
+        """Play `out` [samples, channels] on the DAC (or another output device), return the
+        mono mic recording."""
+        dev = self._find(self.outputs, device, "output device") if device else self.out
         com = None
         if sys.platform == "win32":
             # WASAPI streams only start on a thread that has COM initialised; the
@@ -65,28 +106,28 @@ class Audio:
             # A DAC or HDMI link that was idle, or was just released by the playback
             # engine, can swallow the first half second. Wake it with silence first.
             if time.monotonic() - self._last_play > 5:
-                self._try(np.zeros((int(0.6 * self.fs), out.shape[1])), 0.0)
-            rec = self._try(out, extra)
+                self._try(np.zeros((int(0.6 * self.fs), out.shape[1])), 0.0, dev)
+            rec = self._try(out, extra, dev)
             self._last_play = time.monotonic()
             return rec
         finally:
             if com:
                 com.CoUninitialize()
 
-    def _try(self, out, extra):
+    def _try(self, out, extra, dev):
+        if not self.exclusive.get(dev["name"], sys.platform == "win32"):
+            return self._playrec(out, extra, False, dev)
         try:
-            return self._playrec(out, extra, self.exclusive)
+            return self._playrec(out, extra, True, dev)
         except _sd().PortAudioError:
-            if not self.exclusive:
-                raise
-            self.exclusive = False  # device refused exclusive mode: use shared mode
-            return self._playrec(out, extra, False)
+            self.exclusive[dev["name"]] = False  # device refused exclusive mode: use shared mode
+            return self._playrec(out, extra, False, dev)
 
-    def _playrec(self, signal, extra, exclusive):
+    def _playrec(self, signal, extra, exclusive, dev):
         sd = _sd()
-        fs, n_out = self.fs, self.out["channels"]
+        fs, n_out = self.fs, dev["channels"]
         if signal.shape[1] > n_out:
-            raise RuntimeError(f"The DAC only has {n_out} channels.")
+            raise RuntimeError(f"{dev['name']} only has {n_out} channels.")
         play = np.zeros((len(signal), n_out), np.float32)
         play[:, :signal.shape[1]] = signal
         rec = np.zeros(len(signal) + int(extra * fs), np.float32)
@@ -118,7 +159,7 @@ class Audio:
             extra_in._streaminfo.streamOption = extra_out._streaminfo.streamOption = 1  # eStreamOptionRaw
         with sd.InputStream(device=self.inp["index"], channels=self.in_ch + 1, samplerate=fs,
                             dtype="float32", callback=on_input, extra_settings=extra_in), \
-             sd.OutputStream(device=self.out["index"], channels=n_out, samplerate=fs,
+             sd.OutputStream(device=dev["index"], channels=n_out, samplerate=fs,
                              dtype="float32", callback=on_output, extra_settings=extra_out):
             if not done.wait(len(rec) / fs + 10):
                 raise RuntimeError("Audio device stopped responding.")

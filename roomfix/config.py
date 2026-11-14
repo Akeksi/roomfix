@@ -26,6 +26,10 @@ DEFAULT = {
     # one entry per way, lowest first. min_freq = lowest frequency the driver may be crossed at.
     "ways": [{"name": "Full range", "min_freq": 0}],
     "crossover": {"freqs": [], "slope": "LR4"},
+    # one subwoofer for the bass of all speakers. device "" = a channel of the DAC above,
+    # otherwise another output device (its different latency is measured and compensated).
+    "sub": {"enabled": False, "device": "", "channel": 2, "crossover": 80.0,
+            "max_level_db": None},  # None = same test level limit as the speakers
     "target": {
         "tilt": -0.8,               # dB per octave
         "bass_boost": 3.0,          # dB shelf below bass_freq
@@ -58,6 +62,7 @@ def load():
         saved = json.loads(path.read_text(encoding="utf-8"))
         cfg.update({k: v for k, v in saved.items() if k in DEFAULT})
         cfg["target"] = {**DEFAULT["target"], **cfg["target"]}
+        cfg["sub"] = {**DEFAULT["sub"], **cfg["sub"]}
     return cfg
 
 
@@ -78,13 +83,30 @@ def demo():
     return cfg
 
 
+def sub(cfg):
+    """The subwoofer settings, or None without a subwoofer."""
+    s = cfg.get("sub") or {}
+    return s if s.get("enabled") else None
+
+
+def sub_device(cfg):
+    """Name of the separate output device of the subwoofer, or None if it shares the DAC."""
+    s = sub(cfg)
+    return s["device"] if s and s["device"] and s["device"] != cfg["output_device"] else None
+
+
 def wiring_key(cfg):
     """Changes whenever the channel assignment changes, forcing a new wiring check."""
-    return json.dumps([cfg["output_device"], [s["channels"] for s in cfg["speakers"]]])
+    s = sub(cfg)
+    return json.dumps([cfg["output_device"], [s["channels"] for s in cfg["speakers"]]]
+                      + ([[s["device"], s["channel"]]] if s else []))
 
 
-def validate(cfg, n_out=None):
-    """Return a list of problems; an empty list means the setup is safe to use."""
+def validate(cfg, n_out=None, n_sub=None):
+    """Return a list of problems; an empty list means the setup is safe to use.
+
+    n_out / n_sub: channel counts of the DAC and of a separate subwoofer device, if known.
+    """
     errors = []
     ways, xo = cfg["ways"], cfg["crossover"]
     n = len(ways)
@@ -97,6 +119,21 @@ def validate(cfg, n_out=None):
         if len(spk["channels"]) != n:
             errors.append(f"{spk['name']}: needs exactly {n} DAC channel(s).")
         used += spk["channels"]
+    s = sub(cfg)
+    if s:
+        if sub_device(cfg) is None:
+            used.append(s["channel"])
+        elif n_sub is not None and s["channel"] >= n_sub:
+            errors.append(f"The subwoofer device only has {n_sub} channels.")
+        if not 30 <= s["crossover"] <= 300:
+            errors.append("Subwoofer crossover must be between 30 and 300 Hz.")
+        if s["max_level_db"] is not None and not -60 <= s["max_level_db"] <= 0:
+            errors.append("Maximum subwoofer test level must be between -60 and 0 dBFS.")
+        if cfg["backend"] != "camilladsp":
+            errors.append("A subwoofer requires the CamillaDSP engine.")
+        elif sub_device(cfg) and not cfg["capture_device"]:
+            errors.append("Select the system audio source: it is needed to measure the delay "
+                          "between the two output devices.")
     if len(set(used)) != len(used):
         errors.append("Each DAC channel can only be used once.")
     if n_out is not None and used and max(used) >= n_out:

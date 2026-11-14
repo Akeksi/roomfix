@@ -41,6 +41,17 @@
     </div>
     <table id="speakers"></table>
     <div id="xo-setup"></div>
+    <h3>Subwoofer</h3>
+    <div class="grid">
+      <label class="check"><input id="sub_enabled" type="checkbox"> Use a subwoofer for the bass of all speakers</label>
+      <label class="sub-opt">Connected to<select id="sub_device"></select></label>
+      <label class="sub-opt">Channel<select id="sub_channel"></select></label>
+      <label class="sub-opt">Crossover (Hz)<input id="sub_crossover" type="number" min="30" max="300" step="5"></label>
+      <label class="sub-opt">Loudest allowed subwoofer test signal (dBFS, empty = as above)<input id="sub_max" type="number" min="-60" max="0" step="1"></label>
+    </div>
+    <p id="sub-note" class="muted" hidden>The subwoofer is on its own output device. roomfix measures the delay between
+      the two devices through the playback engine and compensates it. Leave the Windows volume of both devices and the
+      volume of the amplifiers as they are after measuring; use the Windows volume of the system audio source to listen louder or quieter.</p>
     <ul id="errors" class="errors"></ul>
   </details>
 

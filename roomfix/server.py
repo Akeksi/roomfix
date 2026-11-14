@@ -37,14 +37,14 @@ class App:
                     "inputs": [{"name": self.cfg["input_device"], "channels": 1}]}
         return audio.list_devices()
 
-    def n_out(self):
-        for dev in self.devices()["outputs"]:
-            if dev["name"] == self.cfg["output_device"]:
-                return dev["channels"]
-        return None
+    def channels(self):
+        return {dev["name"]: dev["channels"] for dev in self.devices()["outputs"]}
 
     def errors(self):
-        errs = config.validate(self.cfg, self.n_out())
+        channels, other = self.channels(), config.sub_device(self.cfg)
+        errs = config.validate(self.cfg, channels.get(self.cfg["output_device"]), channels.get(other))
+        if other and other not in channels:
+            errs.insert(0, "The subwoofer's output device is not connected.")
         if not self.cfg["output_device"]:
             errs.insert(0, "Select the DAC.")
         if not self.cfg["input_device"]:
@@ -61,7 +61,8 @@ class App:
         """Everything a measurement depends on; if it changes, measure again."""
         c = self.cfg
         return json.dumps([c["output_device"], c["input_device"], c["input_channel"], c["sample_rate"],
-                           [s["channels"] for s in c["speakers"]], [w.get("min_freq") for w in c["ways"]]])
+                           [s["channels"] for s in c["speakers"]], [w.get("min_freq") for w in c["ways"]],
+                           [c["sub"]["device"], c["sub"]["channel"]] if config.sub(c) else None])
 
     def _save_measurement(self):
         arrays = {k: np.array(v) for k, v in self.meas["irs"].items()}
@@ -123,7 +124,7 @@ class App:
     def apply(self):
         if self.design is None:
             raise RuntimeError("Measure first.")
-        return engine.apply(self.cfg, self.design, self.n_out() or 0)
+        return engine.apply(self.cfg, self.design, self.channels())
 
     def start(self, action, auto_apply=True):
         with self.lock:
@@ -263,6 +264,17 @@ def make_handler(app):
     return Handler
 
 
+class Server(ThreadingHTTPServer):
+    # Python's default lets a second roomfix bind the same port on Windows, after which
+    # either instance answers at random. One instance only.
+    allow_reuse_address = False
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def serve(app, port=8137):
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app))
-    return server
+    return Server(("127.0.0.1", port), make_handler(app))

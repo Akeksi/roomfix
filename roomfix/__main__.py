@@ -18,8 +18,15 @@ def main():
         os.environ.setdefault("ROOMFIX_HOME", tempfile.mkdtemp(prefix="roomfix-demo-"))
 
     from .server import App, serve
-    server = serve(App(demo=args.demo), args.port)
     url = f"http://127.0.0.1:{args.port}/"
+    try:
+        server = serve(App(demo=args.demo), args.port)
+    except OSError:
+        print(f"roomfix is already running at {url} (or another program uses port {args.port}; "
+              "choose another one with --port)")
+        if not args.no_browser:
+            webbrowser.open(url)
+        return
     print(f"roomfix {__version__} is running at {url}  (Ctrl+C to quit)")
     if not args.no_browser:
         webbrowser.open(url)

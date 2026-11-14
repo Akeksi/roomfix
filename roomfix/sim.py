@@ -8,7 +8,7 @@ import time
 import numpy as np
 from scipy import signal
 
-from . import dsp
+from . import config, dsp, engine
 
 N_IR = 1 << 14
 
@@ -21,7 +21,7 @@ def _delay(ir, samples):
 class SimAudio:
     simulated = True
 
-    def __init__(self, cfg, seed=1, noise_db=-75.0, realtime=False, flipped=()):
+    def __init__(self, cfg, seed=1, noise_db=-75.0, realtime=False, flipped=(), engine_latency_ms=(150.0, 70.0)):
         self.flipped = set(flipped)  # (speaker, way) pairs wired with reversed polarity
         self.realtime = realtime
         self.fs = cfg["sample_rate"]
@@ -29,7 +29,10 @@ class SimAudio:
         self.noise = 10 ** (noise_db / 20)
         self.rng = np.random.default_rng(seed)
         self.position = 0
-        self.history = []  # every signal ever played, for safety tests
+        self.history = []  # every signal ever played on the DAC, for safety tests
+        self.history_other = []  # ... and on the subwoofer's own output device
+        # latency of the playback engine + device: the DAC's, the subwoofer device's
+        self.engine_latency_ms = tuple(engine_latency_ms)
         self._irs = {}
 
     def _driver(self, way, n_ways):
@@ -49,7 +52,12 @@ class SimAudio:
         if key in self._irs:
             return self._irs[key]
         fs, n_ways = self.fs, len(self.cfg["ways"])
-        filters, sens, offset_ms = self._driver(wi, n_ways)
+        if si == "sub":  # a subwoofer a little further away than the speakers
+            filters, sens, offset_ms = [{"type": "Highpass", "freq": 25, "q": 0.8},
+                                        {"type": "Lowpass", "freq": 200, "q": 0.6}], 6.0, 0.0
+            si = 2
+        else:
+            filters, sens, offset_ms = self._driver(wi, n_ways)
         rng = np.random.default_rng(1000 * si + pos)  # same room for all ways of a speaker
         # room modes: different per speaker, slightly different per mic position
         modes = [(43, 9, 7), (68, 6, 6), (97, -7, 5), (128, 5, 5), (171, -4, 4), (236, 3, 4)]
@@ -70,17 +78,52 @@ class SimAudio:
         self._irs[key] = ir
         return ir
 
-    def playrec(self, out, extra=0.6):
+    def device_channels(self):
+        return {}
+
+    def _drivers(self, device):
+        """(ir key, channel) of everything connected to an output device."""
+        sub, other = config.sub(self.cfg), config.sub_device(self.cfg)
+        found = []
+        if device in (None, self.cfg["output_device"]):
+            found = [((si, wi), ch) for si, spk in enumerate(self.cfg["speakers"]) for wi, ch in enumerate(spk["channels"])]
+        if sub and (other or self.cfg["output_device"]) == (device or self.cfg["output_device"]):
+            found.append((("sub", 0), sub["channel"]))
+        return found
+
+    def _mic(self, out, device, rec, latency):
+        for (si, wi), ch in self._drivers(device):
+            if ch < out.shape[1] and np.any(out[:, ch]):
+                y = signal.fftconvolve(out[:, ch], self._ir(si, wi, self.position))
+                m = min(len(y), len(rec) - latency)
+                rec[latency:latency + m] += y[:m]
+
+    def playrec(self, out, extra=0.6, device=None):
         out = np.asarray(out, float)
         if self.realtime:
             time.sleep(len(out) / self.fs / 3)
-        self.history.append(out.copy())
-        latency = int(self.rng.integers(1500, 6000))
+        other = device not in (None, self.cfg["output_device"])
+        (self.history_other if other else self.history).append(out.copy())
         rec = np.zeros(len(out) + int(extra * self.fs))
-        for si, spk in enumerate(self.cfg["speakers"]):
-            for wi, ch in enumerate(spk["channels"]):
-                if ch < out.shape[1] and np.any(out[:, ch]):
-                    y = signal.fftconvolve(out[:, ch], self._ir(si, wi, self.position))
-                    m = min(len(y), len(rec) - latency)
-                    rec[latency:latency + m] += y[:m]
+        self._mic(out, device, rec, int(self.rng.integers(1500, 6000)))
         return rec + self.noise * self.rng.standard_normal(len(rec))
+
+    def system_playrec(self, configs, outs, extra=1.0, settle=False):
+        """Play through simulated playback engines, one per output device.
+
+        Each engine adds its own latency. One that has just started (settle=False) still
+        holds a random surplus in its buffer, which it reports like the real engine does.
+        """
+        surplus = {dev: 0 if settle else int(self.rng.integers(-250, 250)) for dev, _ in configs}
+        recs = []
+        for out in outs:
+            if self.realtime:
+                time.sleep(len(out) / self.fs / 3)
+            rec = np.zeros(len(out) + int(extra * self.fs))
+            cable = int(self.rng.integers(500, 2000))
+            for i, (dev, conf) in enumerate(configs):
+                played = engine.simulate(conf, out, self.fs)
+                (self.history_other if i else self.history).append(played.copy())
+                self._mic(played, dev, rec, cable + int(self.engine_latency_ms[i] * self.fs / 1000) + surplus[dev])
+            recs.append(rec + self.noise * self.rng.standard_normal(len(rec)))
+        return recs, {dev: engine.TARGET_LEVEL + extra_samples for dev, extra_samples in surplus.items()}

@@ -182,6 +182,129 @@ def test_camilladsp_output_matches_renderer(two_way, tmp_path):
             assert np.abs(y[:n, way["channel"]] - ref[:n, wi]).max() < 1e-9
 
 
+# ---- subwoofer, also on a second output device with different latency -----------
+SUB_LIMIT_DB = -30.0
+
+
+def sub_cfg(device=""):
+    cfg = copy.deepcopy(config.DEFAULT)
+    cfg["capture_device"] = "Simulated cable"
+    cfg["sub"] = dict(config.DEFAULT["sub"], enabled=True, device=device, channel=0 if device else 2,
+                      crossover=90.0, max_level_db=SUB_LIMIT_DB)
+    return cfg
+
+
+@pytest.fixture(scope="module", params=["", "Second DAC"], ids=["same-dac", "other-dac"])
+def with_sub(request):
+    return run(sub_cfg(request.param))
+
+
+def test_subwoofer_extends_bass_and_blends_with_speakers(with_sub):
+    _, _, d = with_sub
+    f = d["freq"]
+    for c in d["curves"]:
+        assert c["range"][0] < 36  # simulated speakers reach 48 Hz, the subwoofer 25 Hz
+        assert error(d, c, "verified") < 0.75 * error(d, c, "measured")
+        diff = np.abs(c["verified"] - c["predicted"])
+        assert np.percentile(diff[(f > 30) & (f < 18000)], 95) < 1.0
+        # the crossover region only adds up as predicted if delay and polarity are right
+        assert diff[(f > 45) & (f < 180)].max() < 2.0
+        # no cancellation: the crossover band is as loud as the bands on either side of it
+        level = lambda lo, hi: np.mean(c["measured"][(f > lo) & (f < hi)])
+        assert level(60, 135) > min(level(35, 55), level(150, 250)) - 3
+
+
+def test_subwoofer_bass_management_export(with_sub):
+    audio, _, d = with_sub
+    cfg = audio.cfg
+    other = cfg["sub"]["device"]
+    configs = engine.camilladsp_configs(cfg, d, {cfg["output_device"]: 4, other: 2})
+    assert [dev for dev, _ in configs] == ([cfg["output_device"], other] if other else [cfg["output_device"]])
+    x = np.random.default_rng(0).standard_normal((FS // 2, 2)) * 0.1
+    out = {dev: engine.simulate(conf, x, FS) for dev, conf in configs}
+    main = out[cfg["output_device"]]
+    for spk in d["speakers"]:  # each speaker is high-passed and plays what the renderer says
+        ref = design.render(spk, x[:, spk["input"]], FS)
+        assert np.abs(main[:, spk["ways"][0]["channel"]] - ref[:, 0]).max() < 1e-9
+        assert any(flt["type"] == "Highpass" and flt["freq"] == 90.0 for flt in spk["ways"][0]["filters"])
+    sub = sum(design.render_sub(d, si, x[:, spk["input"]], FS) for si, spk in enumerate(d["speakers"]))
+    played = out[other or cfg["output_device"]][:, d["sub"]["channel"]]
+    assert np.abs(played - sub).max() < 1e-9  # the subwoofer gets the bass of all speakers
+    spec = np.abs(np.fft.rfft(played)) ** 2
+    fr = np.fft.rfftfreq(len(played), 1 / FS)
+    assert 10 * np.log10(spec[fr > 400].sum() / spec.sum()) < -30
+
+
+def test_camilladsp_runs_subwoofer_configs_like_the_simulation(with_sub, tmp_path):
+    exe = os.environ.get("CAMILLADSP") or shutil.which("camilladsp")
+    if not exe:
+        pytest.skip("camilladsp binary not available")
+    audio, _, d = with_sub
+    x = np.random.default_rng(0).standard_normal((FS, 2)) * 0.1
+    x.astype("<f8").tofile(tmp_path / "in.raw")
+    for i, (_, c) in enumerate(engine.camilladsp_configs(audio.cfg, d)):
+        n_out = c["mixers"]["drivers"]["channels"]["out"]
+        expected = engine.simulate(c, x, FS)
+        c["devices"] = {"samplerate": FS, "chunksize": 1024,
+                        "capture": {"type": "RawFile", "channels": 2, "filename": str(tmp_path / "in.raw"), "format": "F64_LE"},
+                        "playback": {"type": "File", "channels": n_out, "filename": str(tmp_path / f"out{i}.raw"), "format": "F64_LE"}}
+        (tmp_path / "c.yml").write_text(yaml.safe_dump(c, sort_keys=False))
+        subprocess.run([exe, str(tmp_path / "c.yml")], check=True, capture_output=True)
+        y = np.fromfile(tmp_path / f"out{i}.raw", "<f8").reshape(-1, n_out)
+        n = len(y) - 2048
+        assert np.abs(y[:n] - expected[:n]).max() < 1e-9
+
+
+def test_subwoofer_never_played_above_its_own_limit(with_sub):
+    audio, _, _ = with_sub
+    cfg = audio.cfg
+    history = audio.history_other if cfg["sub"]["device"] else audio.history
+    ch = cfg["sub"]["channel"]
+    played = np.concatenate([h[:, ch] for h in history if h.shape[1] > ch])
+    assert 0 < np.max(np.abs(played)) <= 10 ** (SUB_LIMIT_DB / 20) * 1.001
+    mains = np.concatenate([h[:, :2].ravel() for h in audio.history])
+    assert np.max(np.abs(mains)) <= 10 ** (cfg["max_level_db"] / 20) * 1.001
+
+
+def test_latency_between_output_devices_is_compensated():
+    audio, meas, d = run(sub_cfg("Second DAC"))
+    main_ms, sub_ms = audio.engine_latency_ms  # simulated: the speakers' device is much slower
+    assert main_ms - sub_ms > 50
+    assert abs(d["sub"]["delay"] / FS * 1000 - (main_ms - sub_ms)) < 6  # acoustic paths differ a little
+    assert all(w["delay"] < 0.005 * FS for s in d["speakers"] for w in s["ways"])
+    # the other way round: a slow subwoofer device means the speakers must wait
+    audio, meas, d = run(sub_cfg("Second DAC"), engine_latency_ms=(40.0, 160.0))
+    assert d["sub"]["delay"] < 0.005 * FS
+    assert all(abs(w["delay"] / FS * 1000 - 120) < 8 for s in d["speakers"] for w in s["ways"])
+
+
+def test_subwoofer_validation():
+    cfg = sub_cfg()
+    assert config.validate(cfg, n_out=4) == []
+    assert any("only has" in e for e in config.validate(cfg, n_out=2))
+    bad = copy.deepcopy(cfg)
+    bad["sub"]["channel"] = 1
+    assert any("only be used once" in e for e in config.validate(bad))
+    bad = copy.deepcopy(cfg)
+    bad["sub"]["crossover"] = 500
+    assert any("Subwoofer crossover" in e for e in config.validate(bad))
+    bad = copy.deepcopy(cfg)
+    bad["backend"] = "equalizerapo"
+    assert any("subwoofer" in e.lower() for e in config.validate(bad))
+    other = sub_cfg("Second DAC")
+    assert config.validate(other, n_out=2) == []  # channel 1 of the second device is free
+    other["capture_device"] = ""
+    assert any("system audio source" in e for e in config.validate(other))
+
+
+def test_silent_subwoofer_is_reported():
+    cfg = sub_cfg("Second DAC")
+    audio = sim.SimAudio(cfg)
+    audio.cfg = dict(cfg, sub=dict(cfg["sub"], enabled=False))  # subwoofer unplugged
+    with pytest.raises(RuntimeError, match="No sound detected from Subwoofer"):
+        measure.Measurer(cfg, audio).measure()
+
+
 def test_web_api(tmp_path, monkeypatch):
     monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
     from roomfix.server import App, serve
@@ -215,3 +338,13 @@ def test_web_api(tmp_path, monkeypatch):
     call("/api/config", cfg)
     assert call("/api/design")["target"][0] > before + 3
     server.shutdown()
+
+
+def test_second_instance_cannot_take_the_same_port(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    from roomfix.server import App, serve
+    app = App(demo=True)
+    first = serve(app, 0)
+    with pytest.raises(OSError):  # otherwise both would answer, at random
+        serve(app, first.server_address[1])
+    first.server_close()
