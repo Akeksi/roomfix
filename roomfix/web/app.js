@@ -6,7 +6,7 @@ const el = (tag, attrs = {}, ...kids) => {
   e.append(...kids);
   return e;
 };
-let S, cfg, D, version = -1, saveTimer;
+let S, cfg, D, version = -1, saveTimer, dragging = false, volTimer;
 
 async function post(path, body = {}) {
   const r = await fetch(path, { method: "POST", headers: { "X-Roomfix": "1" }, body: JSON.stringify(body) });
@@ -338,6 +338,21 @@ function update(state) {
   $("#demo").hidden = !S.demo;
   $("#engine").textContent = { on: "Correction on", off: "Correction off", demo: "No audio engine in demo" }[S.engine];
   $("#engine").className = "chip" + (S.engine === "on" ? " on" : "");
+  const P = S.playback;  // the running engines: volume, and whether each has its device
+  $("#playback").hidden = !P;
+  if (P) {
+    const down = P.engines.filter((e) => e.status === "waiting");
+    if (down.length) {
+      $("#engine").textContent = "Waiting: " + down.map((e) => e.detail || e.device).join("; ");
+      $("#engine").className = "chip bad";
+    }
+    $("#mute").textContent = P.mute ? "Unmute" : "Mute";
+    $("#mute").className = P.mute ? "on" : "";
+    if (!dragging) {
+      $("#volume").value = P.volume;
+      $("#volume-db").textContent = P.volume.toFixed(1) + " dB";
+    }
+  }
   $("#errors").replaceChildren(...S.errors.map((e) => el("li", { textContent: e })));
   $("#setup-summary").textContent = S.errors.length ? "needs attention"
     : `${S.cfg.speakers.length} × ${S.cfg.ways.length}-way on ${S.cfg.output_device}`
@@ -389,6 +404,15 @@ function act(path, body, msgEl) {
   $("#prompt-no").onclick = act("/api/answer", () => ({ ok: false }));
   $("#apply").onclick = act("/api/apply", null, "#apply-msg");
   $("#bypass").onclick = act("/api/bypass", null, "#apply-msg");
+  $("#mute").onclick = act("/api/mute", () => ({ mute: !S.playback.mute }));
+  const vol = $("#volume"), send = () => post("/api/volume", { value: Number(vol.value) }).catch(() => {});
+  vol.oninput = () => {  // while dragging: show at once, send at most every 80 ms
+    dragging = true;
+    $("#volume-db").textContent = Number(vol.value).toFixed(1) + " dB";
+    clearTimeout(volTimer);
+    volTimer = setTimeout(send, 80);
+  };
+  vol.onchange = () => { clearTimeout(volTimer); send().finally(() => { dragging = false; }); };
   update(S);
   poll();
 })();

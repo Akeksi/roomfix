@@ -11,10 +11,16 @@ def _sd():
     return sd
 
 
-def list_devices():
-    """Input and output devices: [{"name", "channels"}], WASAPI only on Windows."""
+def list_devices(fresh=False):
+    """Input and output devices: [{"name", "channels"}], WASAPI only on Windows.
+
+    fresh: ask Windows again. Otherwise devices connected since the first call are not seen.
+    """
     try:
         sd = _sd()
+        if fresh:
+            sd._terminate()
+            sd._initialize()
         apis = sd.query_hostapis()
         devices = sd.query_devices()
     except Exception:  # no audio system (e.g. a server)

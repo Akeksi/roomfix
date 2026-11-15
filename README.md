@@ -65,8 +65,8 @@ each speaker together with the subwoofer through the running engines.
   volume controls of TV, amplifier and subwoofer where they are: they set the
   balance between speakers and subwoofer. Listen louder or quieter with the
   Windows volume of the virtual cable (the normal volume keys).
-- After the engines start (at login, or when you press Apply), the devices
-  need up to a minute to settle into exact alignment.
+- After the engines start (at login, when you press Apply, or when a device
+  returns), the devices need up to a minute to settle into exact alignment.
 - Known limit: the latency of an output device can differ by a few
   milliseconds from one engine start to the next. roomfix measures the result
   through the running engines and warns if subwoofer and speakers do not add
@@ -76,6 +76,25 @@ Test signals are played in Windows shared mode, so the bit depth and sample
 rate a device is set to do not matter for measuring. In a noisy room, the
 subwoofer is only corrected down to the frequency where it is louder than the
 room's own rumble.
+
+## Always on, and volume
+
+With CamillaDSP, a small background process (`roomfix --engine`) looks after the
+correction. roomfix starts it when you press Apply and, with "Start correction
+with Windows", at login. The roomfix page does not need to be open.
+
+- If an output device disappears (a TV that is switched off, a DAC that is
+  unplugged), its engine stops. The background process waits for the device and
+  starts the engine again within a few seconds of its return, also when Windows
+  has renamed the device meanwhile ("1 - LG TV" to "2 - LG TV"). An engine that
+  fails for another reason is restarted too, with growing pauses.
+- The page shows a volume slider and a mute button while the correction runs,
+  and tells you which device it is waiting for. The volume is the same on all
+  output devices, is remembered, and never goes above 0 dB.
+- Hotkey scripts can use the same local API (the port is in
+  `%APPDATA%oomfix\engine.json`, normally 8136), with `Content-Type: application/json`:
+  `POST /api/volume {"delta": -2}` or `{"value": -20}`, `POST /api/mute {}` (toggle),
+  `POST /api/restart {}`, `GET /api/status`.
 
 ## Active crossovers and driver safety
 

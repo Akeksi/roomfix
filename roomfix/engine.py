@@ -255,8 +255,11 @@ def camilla_running():
 
 
 def camilla_stop():
+    """Stop the supervisor and every engine started from roomfix's own copy of CamillaDSP."""
     if not WINDOWS:
         return
+    from . import supervisor
+    supervisor.stop()  # first: it would start the engines again
     k32, handles = _own_processes(0x0001 | 0x00100000)  # PROCESS_TERMINATE | SYNCHRONIZE
     for handle in handles:
         k32.TerminateProcess(handle, 1)
@@ -271,14 +274,37 @@ def _yamls():
     return sorted(config.data_dir().glob("camilladsp*.yml"))
 
 
-def camilla_start(files=None, ports=None):
-    """Start one engine per configuration file. ports: websocket ports, to query the engines."""
-    files = list(files or _yamls())
+def _check(files):
     for path in files:
         check = subprocess.run([str(_exe()), "--check", str(path)], capture_output=True, text=True,
                                creationflags=0x08000000)
         if check.returncode != 0:
             raise RuntimeError("CamillaDSP rejected the configuration: " + (check.stdout + check.stderr).strip()[-400:])
+
+
+def correction_start():
+    """Start the applied correction: a supervisor in the background, which runs the engines,
+    restarts them when a device returns, and holds the volume. Returns a message."""
+    from . import supervisor
+    _check(_yamls())
+    status = supervisor.start()
+    if status is None:
+        raise RuntimeError("The playback engine could not be started. See engine.log in " + str(config.data_dir()))
+    waiting = [e["detail"] or e["device"] for e in status["engines"] if e["status"] != "running"]
+    if len(waiting) == len(status["engines"]):
+        why = " ".join(waiting)
+        hint = "" if "not connected" in why else (" Check that the output devices and the system audio source "
+                                                  "are all set to the same sample rate in Windows sound settings.")
+        raise RuntimeError(f"CamillaDSP could not start: {why}.{hint} roomfix keeps trying.")
+    if waiting:
+        return "Correction is active (CamillaDSP), but waiting for a device: " + "; ".join(waiting) + "."
+    return "Correction is active (CamillaDSP)."
+
+
+def camilla_start(files, ports):
+    """Start one engine per configuration file, without supervision (for measuring).
+    ports: websocket ports, to query the engines."""
+    _check(files)
     procs = []
     for i, path in enumerate(files):
         log = path.with_suffix(".log")
@@ -296,6 +322,12 @@ def camilla_start(files=None, ports=None):
 
 def _ws(port, command):
     """One request to CamillaDSP's websocket API. Returns the value, or None on any failure."""
+    return (_request(port, command) or {}).get("value")
+
+
+def _request(port, command):
+    """One request to CamillaDSP's websocket API: "GetState", {"SetVolume": -20}...
+    Returns the reply ({"result": "Ok", "value": ...}), or None on any failure."""
     import base64
     import json
     import socket
@@ -314,7 +346,10 @@ def _ws(port, command):
             size = stream.read(2)[1] & 0x7F
             if size == 126:
                 size = struct.unpack(">H", stream.read(2))[0]
-            return next(iter(json.loads(stream.read(size)).values())).get("value")
+            reply = next(iter(json.loads(stream.read(size)).values()))
+            sock.sendall(bytes([0x88, 0x80]) + mask)  # say goodbye, or every request leaves a
+            stream.read(2)                            # "lost connection" warning in the engine's log
+            return reply if isinstance(reply, dict) else None
     except (OSError, ValueError, IndexError, AttributeError, StopIteration):
         return None
 
@@ -379,14 +414,13 @@ def apply(cfg, design, channels=None):
         raise RuntimeError("Select the system audio source in Setup first.")
     _download()
     camilla_stop()
-    camilla_start()
     if cfg["autostart"]:
-        _startup_file().write_text("".join(
-            f'CreateObject("WScript.Shell").Run """{_exe()}"" ""{path}""", 0, False\n' for path in _yamls()),
-            encoding="utf-8")
+        from . import supervisor
+        line = " ".join(f'""{arg}""' for arg in supervisor.command())
+        _startup_file().write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
     elif _startup_file().exists():
         _startup_file().unlink()
-    return "Correction is active (CamillaDSP)."
+    return correction_start()
 
 
 def bypass(cfg):
@@ -413,7 +447,7 @@ class paused:
         if self.cfg["backend"] == "camilladsp":
             if camilla_running():
                 camilla_stop()
-                self.resume = camilla_start
+                self.resume = correction_start
         else:
             path = (eqapo_dir() or Path()) / "roomfix.txt"
             if path.exists():
@@ -430,6 +464,22 @@ class paused:
             except Exception:
                 pass
         return False
+
+
+def playback():
+    """Volume and state of the running engines, from their supervisor: {"volume", "mute",
+    "engines": [{"device", "status", "detail"}]}, or None if it is not running."""
+    if not WINDOWS:
+        return None
+    from . import supervisor
+    return supervisor.request("/api/status")
+
+
+def set_playback(path, body):
+    """Change the volume ("/api/volume") or mute ("/api/mute") of the running engines."""
+    from . import supervisor
+    if supervisor.request(path, body) is None:
+        raise RuntimeError("The correction is not running. Press Apply correction first.")
 
 
 def status(cfg):

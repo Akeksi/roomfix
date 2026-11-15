@@ -9,6 +9,11 @@
 <body>
 <header>
   <h1>roomfix</h1>
+  <span id="playback" class="playback" hidden title="Volume of everything that plays through the correction. It is the same on all output devices, so the balance between speakers and subwoofer stays as measured.">
+    <button id="mute" type="button">Mute</button>
+    <input id="volume" type="range" min="-60" max="0" step="0.5" aria-label="Volume">
+    <output id="volume-db"></output>
+  </span>
   <span id="demo" class="chip" hidden>Demo: simulated speakers</span>
   <span id="engine" class="chip"></span>
 </header>

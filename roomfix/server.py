@@ -98,6 +98,7 @@ class App:
         return {
             "cfg": self.cfg, "demo": self.demo, "devices": self.devices(), "errors": self.errors(),
             "job": self.job, "engine": engine.status(self.cfg), "design_version": self.design_version,
+            "playback": engine.playback() if self.cfg["backend"] == "camilladsp" else None,
             "has_design": self.design is not None, "way_names": config.WAY_NAMES,
             "wiring_ok": len(self.cfg["ways"]) == 1 or self.cfg["wiring_confirmed"] == config.wiring_key(self.cfg),
         }
@@ -257,6 +258,8 @@ def make_handler(app):
                     message = app.apply()
                 elif self.path == "/api/bypass":
                     message = engine.bypass(app.cfg)
+                elif self.path in ("/api/volume", "/api/mute"):
+                    engine.set_playback(self.path, body)
                 else:
                     return self._send(404, {"error": "not found"})
                 self._send(200, {"ok": True, "message": message, "state": app.state()})

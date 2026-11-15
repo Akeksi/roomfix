@@ -12,8 +12,14 @@ def main():
     parser.add_argument("--demo", action="store_true", help="try it with simulated speakers, no hardware needed")
     parser.add_argument("--port", type=int, help="default: 8137, or the next free one")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--engine", action="store_true",
+                        help="run the applied correction in the background: keeps the playback engines running "
+                             "(roomfix starts this itself when you apply a correction, and at login)")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args()
+    if args.engine:
+        from . import supervisor
+        return supervisor.main()
     if args.demo:
         os.environ.setdefault("ROOMFIX_HOME", tempfile.mkdtemp(prefix="roomfix-demo-"))
 
