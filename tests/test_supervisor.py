@@ -147,6 +147,69 @@ def test_volume_set_while_an_engine_was_down_reaches_it_later(tmp_path, monkeypa
     assert (sup.engines[0].port, {"SetVolume": -12.0}) in world.sent
 
 
+def test_correction_can_be_switched_off_and_on(tmp_path, monkeypatch):
+    world, sup = setup(tmp_path, monkeypatch)
+    world.run(sup, 3)
+    assert sup.set_enabled(False)["enabled"] is False
+    world.run(sup, 30)
+    assert statuses(sup) == ["stopped", "stopped"] and len(world.spawned) == 2
+    assert all(p.code is not None for p in world.by_port.values())  # no sound passes: engines are down
+    # it stays off over a restart of the supervisor (next login)...
+    again = supervisor.Supervisor(sup.files, spawn=world.spawn, ask=world.ask, outputs=lambda: world.outputs)
+    assert again.status()["enabled"] is False
+    # ...until switched on, from the tray icon or by applying a correction
+    supervisor.switch_on()
+    again = supervisor.Supervisor(sup.files, spawn=world.spawn, ask=world.ask, outputs=lambda: world.outputs)
+    assert again.status()["enabled"] is True
+    sup.set_enabled(True)
+    world.run(sup, 3)
+    assert statuses(sup) == ["running", "running"] and len(world.spawned) == 4
+
+
+def test_tray_icon_tells_the_state(tmp_path, monkeypatch):
+    from roomfix import tray
+    world, sup = setup(tmp_path, monkeypatch)
+    world.run(sup, 3)
+    sup.set_volume(value=-20)
+    assert tray.summary(sup.status()) == ("on", "roomfix: -20.0 dB")
+    sup.set_mute(True)
+    assert tray.summary(sup.status())[0] == "muted"
+    world.outputs.remove("LG TV (HDMI)")
+    world.by_port[sup.engines[0].port].code = 0
+    world.run(sup, 5)
+    state, text = tray.summary(sup.status())
+    assert state == "waiting" and "LG TV (HDMI) is not connected" in text
+    sup.set_enabled(False)
+    assert tray.summary(sup.status())[0] == "off"
+    for state in tray.COLORS:  # every state has a valid Windows icon with several sizes
+        ico = tray.icon_file(state)
+        assert ico[:4] == bytes([0, 0, 1, 0]) and ico[4] >= 3 and b"PNG" in ico
+    assert tray.icon_file("on") != tray.icon_file("muted")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the notification area is a Windows thing")
+def test_tray_icon_appears_and_goes_away(tmp_path, monkeypatch):
+    from roomfix import tray
+    world, sup = setup(tmp_path, monkeypatch)
+    sup.set_keys(False)  # leave the volume keys of this computer alone
+    icon = tray.Tray(sup)
+    icon.start()
+    assert icon.ready.wait(10) and icon.hwnd and icon.shown == tray.summary(sup.status())
+    assert all(icon.icons.values())  # Windows could load the generated icon
+    icon._show("-20.0 dB", 0.66)  # the volume display can be drawn
+    time.sleep(0.3)
+    world.run(sup, 2)
+    shown = {}
+    icon.u.AppendMenuW = lambda menu, flags, ident, text: shown.update({text: ident}) or 1
+    icon.u.TrackPopupMenu = lambda *args: shown["Mute"]  # the user picks "Mute"
+    icon._menu()
+    assert sup.status()["mute"] is True
+    assert "Correction on" in shown and "Stop correction and close" in shown and "Volume" in shown
+    assert any("LG TV (HDMI): running" in text for text in shown if text)
+    icon.close()
+    assert not icon.thread.is_alive()
+
+
 def test_http_api_and_shutdown(tmp_path, monkeypatch):
     world, sup = setup(tmp_path, monkeypatch)
     thread = threading.Thread(target=supervisor.run, args=(sup, 0), daemon=True)
@@ -160,6 +223,8 @@ def test_http_api_and_shutdown(tmp_path, monkeypatch):
     assert supervisor.request("/api/mute", {"mute": True})["mute"] is True
     assert supervisor.request("/api/mute", {"mute": "toggle"})["mute"] is False
     assert supervisor.request("/api/mute", {})["mute"] is True
+    assert supervisor.request("/api/power", {"on": False})["enabled"] is False
+    assert supervisor.request("/api/power", {"on": "toggle"})["enabled"] is True
     status = supervisor.request("/api/status")
     assert status["volume"] == -15 and [e["device"] for e in status["engines"]] == ["LG TV (HDMI)", "USB DAC"]
     # another website cannot turn the volume up: a form post is refused

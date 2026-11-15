@@ -64,7 +64,7 @@ each speaker together with the subwoofer through the running engines.
 - After measuring, leave the Windows volume of both output devices and the
   volume controls of TV, amplifier and subwoofer where they are: they set the
   balance between speakers and subwoofer. Listen louder or quieter with the
-  Windows volume of the virtual cable (the normal volume keys).
+  volume keys of the keyboard, which roomfix takes over (see below).
 - After the engines start (at login, when you press Apply, or when a device
   returns), the devices need up to a minute to settle into exact alignment.
 - Known limit: the latency of an output device can differ by a few
@@ -88,13 +88,19 @@ with Windows", at login. The roomfix page does not need to be open.
   starts the engine again within a few seconds of its return, also when Windows
   has renamed the device meanwhile ("1 - LG TV" to "2 - LG TV"). An engine that
   fails for another reason is restarted too, with growing pauses.
-- The page shows a volume slider and a mute button while the correction runs,
-  and tells you which device it is waiting for. The volume is the same on all
-  output devices, is remembered, and never goes above 0 dB.
+- **Volume keys.** The Windows volume of a virtual cable does nothing useful, so
+  while the correction is on, the volume and mute keys of the keyboard set
+  roomfix's own volume (2 dB a press, 1 dB with Shift) and show it on screen.
+  The volume is the same on all output devices, is remembered, and never goes
+  above 0 dB. The page has a slider and a mute button for the same volume.
+- **Icon in the notification area** (bottom right). Its colour shows the state:
+  on, muted, waiting for a device, or off. Click it for the menu: mute, volume,
+  open roomfix, restart the engines, switch the correction off and on, give the
+  volume keys back to Windows, open the log folder, or close it all.
 - Hotkey scripts can use the same local API (the port is in
   `%APPDATA%oomfix\engine.json`, normally 8136), with `Content-Type: application/json`:
   `POST /api/volume {"delta": -2}` or `{"value": -20}`, `POST /api/mute {}` (toggle),
-  `POST /api/restart {}`, `GET /api/status`.
+  `POST /api/restart {}`, `POST /api/power {"on": false}`, `GET /api/status`.
 
 ## Active crossovers and driver safety
 

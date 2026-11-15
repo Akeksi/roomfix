@@ -342,7 +342,10 @@ function update(state) {
   $("#playback").hidden = !P;
   if (P) {
     const down = P.engines.filter((e) => e.status === "waiting");
-    if (down.length) {
+    if (!P.enabled) {
+      $("#engine").textContent = "Correction switched off (tray icon)";
+      $("#engine").className = "chip bad";
+    } else if (down.length) {
       $("#engine").textContent = "Waiting: " + down.map((e) => e.detail || e.device).join("; ");
       $("#engine").className = "chip bad";
     }

@@ -27,6 +27,7 @@ from . import config, engine
 
 PORT = 8136  # of the HTTP API, if free. The one in use is in engine.json.
 MIN_DB, MAX_DB = -60.0, 0.0
+STEP_DB = 2.0  # of a volume key; half of it with Shift
 RETRY_MIN, RETRY_MAX = 2.0, 30.0  # seconds before a failed engine is started again
 log = logging.getLogger("roomfix.engine")
 
@@ -184,6 +185,8 @@ class Supervisor:
             saved = {}
         self.volume = self._clamp(saved.get("volume", 0.0))
         self.mute = bool(saved.get("mute", False))
+        self.enabled = bool(saved.get("enabled", True))  # off: engines stopped, the tray icon stays
+        self.keys = bool(saved.get("keys", True))  # the volume keys of the keyboard set this volume
         self.engines = [Engine(self, path, port) for path, port in zip(self.files, _free_ports(len(self.files)))]
         self._restart = False
 
@@ -204,6 +207,10 @@ class Supervisor:
         restart, self._restart = self._restart, False
         for eng in self.engines:
             try:
+                if not self.enabled:
+                    if eng.proc is not None or eng.status != "stopped":
+                        eng.restart(now)  # stops it; starts at once when switched on again
+                    continue
                 if restart:
                     eng.restart(now)
                 eng.check(now)
@@ -215,9 +222,24 @@ class Supervisor:
             eng.stop()
 
     def _changed(self):
-        self._volume_file().write_text(json.dumps({"volume": self.volume, "mute": self.mute}), encoding="utf-8")
+        self._volume_file().write_text(json.dumps({"volume": self.volume, "mute": self.mute,
+                                                   "enabled": self.enabled, "keys": self.keys}), encoding="utf-8")
         for eng in self.engines:
             eng.push()
+
+    def set_enabled(self, on=None):
+        """Switch the correction off (engines stopped: no sound through it) or on again."""
+        with self.lock:
+            self.enabled = (not self.enabled) if on is None else bool(on)
+            log.info("switched %s", "on" if self.enabled else "off")
+            self._changed()
+        return self.status()
+
+    def set_keys(self, on=None):
+        with self.lock:
+            self.keys = (not self.keys) if on is None else bool(on)
+            self._changed()
+        return self.status()
 
     def set_volume(self, value=None, delta=None):
         with self.lock:
@@ -239,6 +261,7 @@ class Supervisor:
 
     def status(self):
         return {"volume": self.volume, "mute": self.mute, "min_db": MIN_DB, "max_db": MAX_DB,
+                "enabled": self.enabled, "keys": self.keys, "step_db": STEP_DB,
                 "engines": [{"device": e.device, "status": e.status, "detail": e.detail} for e in self.engines]}
 
 
@@ -316,6 +339,9 @@ def _handler(sup):
                     result = sup.set_mute(None if mute == "toggle" else mute)
                 elif path == "/api/restart":
                     result = sup.restart()
+                elif path == "/api/power":
+                    on = body.get("on")
+                    result = sup.set_enabled(None if on == "toggle" else on)
                 elif path == "/api/quit":
                     sup.quit.set()
                     result = {"ok": True}
@@ -376,7 +402,17 @@ def main():
     if request("/api/status") is not None or not files:
         return  # already running, or no correction has been applied
     try:
-        run(Supervisor(files))
+        sup = Supervisor(files)
+        icon = None
+        if sys.platform == "win32":
+            from . import tray
+            icon = tray.Tray(sup)  # the icon in the notification area, and the volume keys
+            icon.start()
+        try:
+            run(sup)
+        finally:
+            if icon:
+                icon.close()
     except Exception:
         log.exception("supervisor failed")
         raise
@@ -401,12 +437,23 @@ def request(path, body=None, timeout=1.5):
         return None
 
 
-def command():
-    """The command line that starts the supervisor."""
+def command(page=False):
+    """The command line that starts the supervisor, or (page=True) the roomfix page."""
+    args = [] if page else ["--engine"]
     if getattr(sys, "frozen", False):  # roomfix.exe
-        return [sys.executable, "--engine"]
-    exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    return [exe if os.path.exists(exe) else sys.executable, "-m", "roomfix", "--engine"]
+        return [sys.executable, *args]
+    exe = os.path.join(os.path.dirname(sys.executable), "python.exe" if page else "pythonw.exe")
+    return [exe if os.path.exists(exe) else sys.executable, "-m", "roomfix", *args]
+
+
+def switch_on():
+    """Before a start: a correction that was switched off from the tray icon is on again."""
+    try:
+        saved = json.loads(Supervisor._volume_file().read_text(encoding="utf-8"))
+        if saved.get("enabled") is False:
+            Supervisor._volume_file().write_text(json.dumps(dict(saved, enabled=True)), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
 
 
 def start(timeout=25.0):

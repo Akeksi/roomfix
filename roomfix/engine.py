@@ -287,6 +287,7 @@ def correction_start():
     restarts them when a device returns, and holds the volume. Returns a message."""
     from . import supervisor
     _check(_yamls())
+    supervisor.switch_on()
     status = supervisor.start()
     if status is None:
         raise RuntimeError("The playback engine could not be started. See engine.log in " + str(config.data_dir()))
