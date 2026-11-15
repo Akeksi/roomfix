@@ -353,7 +353,7 @@ class session:
         while good < 4 and time.monotonic() < end:
             time.sleep(1.0)
             levels = list(self.buffers().values())
-            ok = all(v is not None and abs(v - TARGET_LEVEL) < 0.12 * TARGET_LEVEL for v in levels)
+            ok = all(v is not None and abs(v - TARGET_LEVEL) < 0.06 * TARGET_LEVEL for v in levels)  # 1.3 ms
             good = good + 1 if ok else 0
         return good >= 4
 

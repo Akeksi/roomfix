@@ -70,3 +70,13 @@ svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nu
 .tip span { float: right; margin-left: 14px; color: var(--ink); }
 .tip div { color: var(--ink2); }
 [hidden] { display: none !important; }
+.label-text { display: block; }
+.info {
+  display: inline-grid; place-items: center; width: 16px; height: 16px; padding: 0; margin-left: 6px; flex: none;
+  border-radius: 50%; font: italic 600 11px/1 Georgia, serif; color: var(--ink2); vertical-align: 1px; cursor: help;
+}
+.info:hover, .info:focus { color: var(--s1); border-color: var(--s1); }
+.help {
+  position: fixed; z-index: 6; max-width: 300px; background: var(--surface); color: var(--ink); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 8px 12px; font-size: 13px; line-height: 1.4; box-shadow: 0 2px 10px rgba(0, 0, 0, .15);
+}

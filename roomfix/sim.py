@@ -21,7 +21,12 @@ def _delay(ir, samples):
 class SimAudio:
     simulated = True
 
-    def __init__(self, cfg, seed=1, noise_db=-75.0, realtime=False, flipped=(), engine_latency_ms=(150.0, 70.0)):
+    def __init__(self, cfg, seed=1, noise_db=-75.0, realtime=False, flipped=(), engine_latency_ms=(150.0, 70.0),
+                 windows_volume_db=(0.0, 0.0), rumble_db=None):
+        self.rumble = 10 ** (rumble_db / 20) if rumble_db is not None else 0.0  # room noise below 35 Hz
+        # Windows volume of the DAC and of the subwoofer's device: applies to test signals
+        # played directly (shared mode), not to the playback engine (exclusive mode)
+        self.windows_volume = tuple(10 ** (v / 20) for v in windows_volume_db)
         self.flipped = set(flipped)  # (speaker, way) pairs wired with reversed polarity
         self.realtime = realtime
         self.fs = cfg["sample_rate"]
@@ -78,6 +83,14 @@ class SimAudio:
         self._irs[key] = ir
         return ir
 
+    def _noise(self, n):
+        x = self.noise * self.rng.standard_normal(n)
+        if self.rumble:
+            sos = signal.butter(4, [12, 35], "bandpass", fs=self.fs, output="sos")
+            low = signal.sosfilt(sos, self.rng.standard_normal(n + self.fs))[self.fs:]
+            x += self.rumble * low / np.sqrt(np.mean(low ** 2))
+        return x
+
     def device_channels(self):
         return {}
 
@@ -105,8 +118,8 @@ class SimAudio:
         other = device not in (None, self.cfg["output_device"])
         (self.history_other if other else self.history).append(out.copy())
         rec = np.zeros(len(out) + int(extra * self.fs))
-        self._mic(out, device, rec, int(self.rng.integers(1500, 6000)))
-        return rec + self.noise * self.rng.standard_normal(len(rec))
+        self._mic(out * self.windows_volume[other], device, rec, int(self.rng.integers(1500, 6000)))
+        return rec + self._noise(len(rec))
 
     def system_playrec(self, configs, outs, extra=1.0, settle=False):
         """Play through simulated playback engines, one per output device.
@@ -125,5 +138,5 @@ class SimAudio:
                 played = engine.simulate(conf, out, self.fs)
                 (self.history_other if i else self.history).append(played.copy())
                 self._mic(played, dev, rec, cable + int(self.engine_latency_ms[i] * self.fs / 1000) + surplus[dev])
-            recs.append(rec + self.noise * self.rng.standard_normal(len(rec)))
+            recs.append(rec + self._noise(len(rec)))
         return recs, {dev: engine.TARGET_LEVEL + extra_samples for dev, extra_samples in surplus.items()}

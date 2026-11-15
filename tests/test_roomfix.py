@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import json
 import os
 import shutil
@@ -348,3 +348,102 @@ def test_second_instance_cannot_take_the_same_port(tmp_path, monkeypatch):
     with pytest.raises(OSError):  # otherwise both would answer, at random
         serve(app, first.server_address[1])
     first.server_close()
+
+def test_demo_and_normal_instance_do_not_share_a_port(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    from types import SimpleNamespace
+    from roomfix.server import App, open_server, serve
+    first = serve(App(demo=False), 0)  # a normal roomfix is running on the default port
+    port = first.server_address[1]
+    threading.Thread(target=first.serve_forever, daemon=True).start()
+    # the demo must not send the user to the normal instance: it takes the next free port
+    demo, url = open_server(App(demo=True), default=port)
+    assert demo is not None and demo.server_address[1] != port and str(demo.server_address[1]) in url
+    demo.server_close()
+    # starting the same kind again just points to the one that is running
+    again, url = open_server(SimpleNamespace(demo=False), default=port)
+    assert again is None and url == f"http://127.0.0.1:{port}/"
+    # a port the user asked for is never silently replaced
+    with pytest.raises(OSError):
+        open_server(App(demo=True), port=port)
+    first.shutdown()
+    first.server_close()
+
+
+def test_system_audio_source_is_preselected():
+    inputs = [{"name": "Mikrofoni (Umik-1  Gain: 18dB  )"}, {"name": "CABLE Output (VB-Audio Virtual Cable)"}]
+    assert config.guess_capture(inputs) == "CABLE Output (VB-Audio Virtual Cable)"
+    assert config.guess_capture(inputs[:1]) == ""
+
+
+def test_default_channels_keep_tweeters_off_the_first_two_channels():
+    # Windows plays stereo to channels 1 and 2 of a device: only woofers may sit there
+    assert config.default_channels(2, 3) == [[0, 2, 4], [1, 3, 5]]
+    assert config.default_channels(3, 1) == [[0], [1], [2]]
+    assert [s["channels"] for s in config.demo()["speakers"]] == [[0, 2], [1, 3]]
+
+
+def test_test_signals_are_played_in_shared_mode(monkeypatch):
+    # Exclusive mode plays with gaps on some USB DACs and on VB-CABLE (heard as a distorted,
+    # robotic sweep, several dB too weak). Shared mode also accepts any device format.
+    from roomfix import audio
+    opened = []
+
+    class Settings:
+        def __init__(self, exclusive=False):
+            opened.append(exclusive)
+            self._streaminfo = type("Info", (), {})()
+
+    class Stream:
+        def __init__(self, **kw): pass
+        def __enter__(self): raise RuntimeError("opened")
+        def __exit__(self, *exc): return False
+    fake = type("sd", (), {"WasapiSettings": Settings, "InputStream": Stream, "OutputStream": Stream})
+    monkeypatch.setattr(audio, "_sd", lambda: fake)
+    monkeypatch.setattr(audio.sys, "platform", "win32")
+    a = audio.Audio.__new__(audio.Audio)
+    a.fs, a.in_ch, a.inp = FS, 0, {"index": 0}
+    with pytest.raises(RuntimeError, match="opened"):
+        a._playrec(np.zeros((10, 2)), 0.1, {"name": "DAC", "channels": 2, "index": 1})
+    assert opened == [False, False]
+
+def test_windows_volume_of_an_output_device_does_not_upset_the_balance():
+    # Test signals are played in shared mode, where the Windows volume of a device applies.
+    # The playback engine bypasses it. With the speakers' device at -9 dB in Windows, the
+    # speakers look 9 dB quieter than music will be: the balance must come from the engines.
+    _, _, base = run(sub_cfg("Second DAC"))
+    _, meas, d = run(sub_cfg("Second DAC"), windows_volume_db=(-9.0, 0.0))
+    assert abs(meas["gains"]["sub"][0] + 9) < 1
+    assert np.abs(np.array(d["sub"]["gains"]) - np.array(base["sub"]["gains"])).max() < 1.0
+    f = d["freq"]
+    for c in d["curves"]:
+        assert np.abs(c["verified"] - c["predicted"])[(f > 45) & (f < 180)].max() < 2.0
+
+
+def test_room_rumble_is_not_mistaken_for_subwoofer_output():
+    # A noisy room rumbles below the subwoofer's range. The measurement must not take that
+    # for deep bass and equalize it: the correction starts where the subwoofer rises above the noise.
+    _, meas, quiet = run(sub_cfg("Second DAC"))
+    assert not any("noise" in n for n in quiet["warnings"])
+    _, meas, d = run(sub_cfg("Second DAC"), rumble_db=-30.0)
+    assert any("noise" in n for n in d["warnings"])
+    for c, q, spk in zip(d["curves"], quiet["curves"], d["speakers"]):
+        assert q["range"][0] < 30 < c["range"][0] < 60
+        assert all(flt["freq"] > 30 for flt in spk["eq"])
+    # the delay is still found: it comes from where the sound arrives, not from the noise
+    assert abs(d["sub"]["delay"] - quiet["sub"]["delay"]) < 0.004 * FS
+
+
+def test_changed_delay_between_devices_is_reported():
+    # The latency of an output device can differ from one engine start to the next. If the
+    # verification shows that subwoofer and speakers no longer add up, the user must be told.
+    cfg = sub_cfg("Second DAC")
+    audio = sim.SimAudio(cfg)
+    m = measure.Measurer(cfg, audio)
+    meas = m.measure()
+    d = design.design(cfg, meas)
+    good = design.design(cfg, meas, verify_irs=m.verify(d, meas["levels"]))
+    assert not any("add up" in n for n in good["warnings"])
+    audio.engine_latency_ms = (150.0, 64.5)  # the subwoofer's device restarts 5.5 ms faster
+    bad = design.design(cfg, meas, verify_irs=m.verify(d, meas["levels"]))
+    assert any("add up" in n for n in bad["warnings"])

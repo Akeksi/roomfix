@@ -67,6 +67,15 @@ each speaker together with the subwoofer through the running engines.
   Windows volume of the virtual cable (the normal volume keys).
 - After the engines start (at login, or when you press Apply), the devices
   need up to a minute to settle into exact alignment.
+- Known limit: the latency of an output device can differ by a few
+  milliseconds from one engine start to the next. roomfix measures the result
+  through the running engines and warns if subwoofer and speakers do not add
+  up as predicted at the crossover.
+
+Test signals are played in Windows shared mode, so the bit depth and sample
+rate a device is set to do not matter for measuring. In a noisy room, the
+subwoofer is only corrected down to the frequency where it is louder than the
+room's own rumble.
 
 ## Active crossovers and driver safety
 

@@ -70,13 +70,32 @@ def save(cfg):
     (data_dir() / "settings.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
 
 
+def default_channels(n_speakers, n_ways):
+    """DAC channels per speaker: all woofers first, then the next way, tweeters last.
+
+    Windows plays ordinary stereo to channels 1 and 2 of a device. If that ever happens
+    to the DAC, it must reach woofers, not tweeters. (The web UI uses the same layout.)
+    """
+    return [[wi * n_speakers + si for wi in range(n_ways)] for si in range(n_speakers)]
+
+
+def guess_capture(inputs):
+    """The virtual cable among the recording devices, or "" if there is none."""
+    for word in ("cable output", "vb-audio", "virtual"):
+        for dev in inputs:
+            if word in dev["name"].lower():
+                return dev["name"]
+    return ""
+
+
 def demo():
     """A stereo two-way setup for the built-in simulator."""
     cfg = copy.deepcopy(DEFAULT)
+    left, right = default_channels(2, 2)
     cfg.update(
         output_device="Simulated 8-channel DAC", input_device="Simulated microphone",
-        speakers=[{"name": "Left", "input": 0, "channels": [0, 1]},
-                  {"name": "Right", "input": 1, "channels": [2, 3]}],
+        speakers=[{"name": "Left", "input": 0, "channels": left},
+                  {"name": "Right", "input": 1, "channels": right}],
         ways=[{"name": "Woofer", "min_freq": 0}, {"name": "Tweeter", "min_freq": 1500}],
         crossover={"freqs": [2200], "slope": "LR4"},
     )

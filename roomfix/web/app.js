@@ -56,8 +56,14 @@ function renderSetup() {
       ...cfg.ways.map((_, wi) => el("td", {}, chSelect(spk, wi))), el("td", {}, cfg.speakers.length > 1 ? del : ""));
   });
   $("#speakers").replaceChildren(
-    el("tr", {}, el("th", { textContent: "Name" }), el("th", { textContent: "Plays" }),
-      ...cfg.ways.map((w) => el("th", { textContent: w.name })), el("th")), ...rows);
+    el("tr", {}, el("th", { textContent: "Name" }),
+      el("th", { textContent: "Plays", "data-help": "Which side of the stereo signal this speaker plays." }),
+      ...cfg.ways.map((w, wi) => el("th", { textContent: w.name, "data-help": cfg.ways.length === 1
+        ? "The DAC channel (output jack) this speaker is connected to."
+        : `The DAC channel that the amplifier of this ${w.name.toLowerCase()} is connected to. ` + (wi
+          ? "Keep it off channels 1 and 2: if Windows ever plays directly to the DAC, ordinary stereo goes to those two channels without the crossover."
+          : "Woofers belong on channels 1 and 2: they are not harmed if Windows ever plays directly to the DAC.") })),
+      el("th")), ...rows);
 
   const sub = cfg.sub;
   $("#sub_enabled").checked = sub.enabled;
@@ -76,20 +82,52 @@ function renderSetup() {
     cfg.crossover.freqs.forEach((f, i) => {
       const inp = el("input", { type: "number", min: 20, max: 20000, value: f,
         oninput: () => { cfg.crossover.freqs[i] = +inp.value; save(); } });
-      grid.append(el("label", {}, `Crossover ${cfg.ways[i].name} / ${cfg.ways[i + 1].name} (Hz)`, inp));
+      grid.append(el("label", { "data-help": "Where one driver hands over to the next. It can be changed after measuring, without measuring again." },
+        `Crossover ${cfg.ways[i].name} / ${cfg.ways[i + 1].name} (Hz)`, inp));
     });
     cfg.ways.slice(1).forEach((w) => {
       const inp = el("input", { type: "number", min: 20, max: 20000, value: w.min_freq || "",
         oninput: () => { w.min_freq = +inp.value; save(); } });
-      grid.append(el("label", {}, `${w.name}: lowest safe crossover (Hz)`, inp));
+      grid.append(el("label", { "data-help": "From the data sheet of the driver. It never receives a test signal or a crossover below this frequency." },
+        `${w.name}: lowest safe crossover (Hz)`, inp));
     });
     const slope = el("select", { onchange: () => { cfg.crossover.slope = slope.value; save(); } },
       ...[["LR2", "12 dB/oct"], ["LR4", "24 dB/oct"], ["LR8", "48 dB/oct"]].map(([v, t]) =>
         el("option", { value: v, textContent: `Linkwitz-Riley ${t}` })));
     slope.value = cfg.crossover.slope;
-    grid.append(el("label", {}, "Crossover slope", slope));
+    grid.append(el("label", { "data-help": "How steeply the drivers are separated. 24 dB/oct suits most speakers; 48 dB/oct protects tweeters better when crossing low." }, "Crossover slope", slope));
     xo.append(el("h3", { textContent: "Crossover" }),
       el("p", { className: "muted", textContent: "The lowest safe crossover is a hard limit from the driver's data sheet: the driver is never tested or crossed over below it." }), grid);
+  }
+  addHelp();
+}
+
+// ---------- info dots ----------
+function addHelp() {
+  const box = $("#help");
+  for (const host of document.querySelectorAll("[data-help]")) {
+    if (host.querySelector(".info")) continue;
+    const dot = el("button", { type: "button", className: "info", textContent: "i" });
+    dot.setAttribute("aria-label", "Explanation");
+    const show = () => {
+      box.textContent = host.dataset.help;
+      box.hidden = false;
+      const r = dot.getBoundingClientRect();
+      box.style.left = Math.max(8, Math.min(r.left - 12, innerWidth - box.offsetWidth - 8)) + "px";
+      const below = r.bottom + 8 + box.offsetHeight < innerHeight;
+      box.style.top = (below ? r.bottom + 8 : r.top - 8 - box.offsetHeight) + "px";
+    };
+    dot.onpointerenter = dot.onfocus = show;
+    dot.onpointerleave = dot.onblur = () => { box.hidden = true; };
+    // inside a label, a click would otherwise operate the control the label belongs to
+    dot.onclick = (e) => { e.preventDefault(); e.stopPropagation(); dot.focus(); show(); };
+    const kids = [...host.childNodes];
+    const first = kids.findIndex((n) => n.nodeType === 1 && n.matches("input:not([type=checkbox]), select, textarea, .row"));
+    if (first > 0) {  // keep the dot on the line of the label text, above the control
+      const text = el("span", { className: "label-text" });
+      host.insertBefore(text, kids[0]);
+      text.append(...kids.slice(0, first), dot);
+    } else host.append(dot);
   }
 }
 
@@ -99,8 +137,8 @@ function setWays(n) {
   cfg.ways = S.way_names[n].map((name, i) => ({ name, min_freq: mins[i] }));
   cfg.crossover.freqs = defaults;
   if (n > 1) cfg.backend = "camilladsp";
-  let next = 0;
-  for (const spk of cfg.speakers) spk.channels = cfg.ways.map(() => next++);
+  // all woofers first, tweeters last: Windows plays plain stereo to channels 1 and 2
+  cfg.speakers.forEach((spk, si) => { spk.channels = cfg.ways.map((_, wi) => wi * cfg.speakers.length + si); });
 }
 
 function save(rerender) {

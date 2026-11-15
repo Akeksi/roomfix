@@ -19,6 +19,8 @@ class App:
         if demo:
             engine.WINDOWS = False  # demo never touches the real audio engine
         self.cfg = config.demo() if demo else config.load()
+        if not demo and not self.cfg["capture_device"]:  # first run: find the virtual cable
+            self.cfg["capture_device"] = config.guess_capture(self.devices()["inputs"])
         self.meas = self.verify_irs = self.design = None
         self.design_version = 0
         self.job = {"running": False, "action": "", "progress": 0, "message": "", "active": None,
@@ -278,3 +280,32 @@ class Server(ThreadingHTTPServer):
 
 def serve(app, port=8137):
     return Server(("127.0.0.1", port), make_handler(app))
+
+
+def _running(port):
+    """What answers on the port: True/False = a roomfix (demo or not), None = something else."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=2) as r:
+            return bool(json.loads(r.read())["demo"])
+    except Exception:
+        return None
+
+
+def open_server(app, port=None, default=8137):
+    """Start the server. Returns (server, url), or (None, url) if this kind of roomfix
+    (normal or demo) is already running at url.
+
+    Without an explicit port, a busy port is skipped unless the same kind of roomfix has
+    it: a demo next to a normal roomfix gets its own port instead of opening the other.
+    """
+    if port is not None:
+        return serve(app, port), f"http://127.0.0.1:{port}/"
+    for p in range(default, default + 20):
+        url = f"http://127.0.0.1:{p}/"
+        try:
+            return serve(app, p), url
+        except OSError:
+            if _running(p) == app.demo:
+                return None, url
+    raise OSError("no free port")

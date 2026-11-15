@@ -42,7 +42,6 @@ class Audio:
         self.in_ch = cfg["input_channel"]
         if self.in_ch >= self.inp["channels"]:
             raise RuntimeError("The selected microphone input channel does not exist.")
-        self.exclusive = {}  # per output device: False once it has refused exclusive mode
         self._last_play = -1e9
 
     @staticmethod
@@ -106,24 +105,15 @@ class Audio:
             # A DAC or HDMI link that was idle, or was just released by the playback
             # engine, can swallow the first half second. Wake it with silence first.
             if time.monotonic() - self._last_play > 5:
-                self._try(np.zeros((int(0.6 * self.fs), out.shape[1])), 0.0, dev)
-            rec = self._try(out, extra, dev)
+                self._playrec(np.zeros((int(0.6 * self.fs), out.shape[1])), 0.0, dev)
+            rec = self._playrec(out, extra, dev)
             self._last_play = time.monotonic()
             return rec
         finally:
             if com:
                 com.CoUninitialize()
 
-    def _try(self, out, extra, dev):
-        if not self.exclusive.get(dev["name"], sys.platform == "win32"):
-            return self._playrec(out, extra, False, dev)
-        try:
-            return self._playrec(out, extra, True, dev)
-        except _sd().PortAudioError:
-            self.exclusive[dev["name"]] = False  # device refused exclusive mode: use shared mode
-            return self._playrec(out, extra, False, dev)
-
-    def _playrec(self, signal, extra, exclusive, dev):
+    def _playrec(self, signal, extra, dev):
         sd = _sd()
         fs, n_out = self.fs, dev["channels"]
         if signal.shape[1] > n_out:
@@ -153,9 +143,12 @@ class Audio:
 
         extra_in = extra_out = None
         if sys.platform == "win32":
+            # Shared mode: Windows converts to whatever sample rate and bit depth the device
+            # is set to. (Exclusive mode is not dependable: on some USB DACs and on virtual
+            # cables it plays with gaps, heard as a distorted, robotic sweep.)
             # Raw mode bypasses the Windows audio effects. Without it, microphone noise
             # suppression gates the test signals and output enhancements colour them.
-            extra_in, extra_out = sd.WasapiSettings(), sd.WasapiSettings(exclusive=exclusive)
+            extra_in, extra_out = sd.WasapiSettings(), sd.WasapiSettings()
             extra_in._streaminfo.streamOption = extra_out._streaminfo.streamOption = 1  # eStreamOptionRaw
         with sd.InputStream(device=self.inp["index"], channels=self.in_ch + 1, samplerate=fs,
                             dtype="float32", callback=on_input, extra_settings=extra_in), \

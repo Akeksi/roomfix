@@ -266,25 +266,48 @@ def design(cfg, meas, cal=None, verify_irs=None):
         lp = dsp.linkwitz_riley("Lowpass", fc, "LR4")
         h_lp = dsp.response(lp, fs, f)
         offsets = meas.get("offsets", {}).get("sub") or [0.0] * len(meas["irs"]["sub"])
-        hs = [np.fft.rfft(ir, NFFT) / mic * np.exp(-2j * np.pi * f * off / fs)
-              for ir, off in zip(meas["irs"]["sub"], offsets)]
+        # (on its own device, the subwoofer's level relative to the speakers is the one
+        # measured through the playback engines, like its delay)
+        gains = meas.get("gains", {}).get("sub") or [0.0] * len(offsets)
+        hs = [np.fft.rfft(ir, NFFT) / mic * np.exp(-2j * np.pi * f * off / fs) * 10 ** (gain / 20)
+              for ir, off, gain in zip(meas["irs"]["sub"], offsets, gains)]
         sub_db = _smooth_db(f, np.mean([np.abs(h) ** 2 for h in hs], axis=0), 1 / 6)
         sub_offset = _mean_db(sub_db - shape, fc / 2.5, fc)
         upper = sum(w["total"][0] * np.exp(-2j * np.pi * f * spk["delay"] / fs) * 10 ** ((common - w["offset"]) / 20)
                     for spk, w in zip(speakers, work))
         lower = hs[0] * h_lp * 10 ** ((common - sub_offset) / 20) * len(speakers)
-        # the devices may be far apart in time: find the bulk delay first, then the exact one
+        # The devices may be far apart in time: find the bulk delay first, then the exact one.
+        # Bass rings on in a room, so the two correlate at many delays, tens of milliseconds
+        # apart. The right one is next to where the sound actually arrives: the subwoofer's
+        # bass against the direct sound of the speakers.
         band = (f > fc / 2) & (f < fc * 2)
-        cross = np.zeros(len(f), complex)
+        cross, seen = np.zeros(len(f), complex), np.zeros(len(f), complex)
         cross[band] = lower[band] * np.conj(upper[band])
-        k = int(np.argmax(np.abs(signal.hilbert(np.fft.irfft(cross, NFFT)))))
-        bulk = k if k < NFFT // 2 else k - NFFT
+        seen[band] = lower[band]
+        t_sub = dsp.envelope_peak(np.fft.irfft(seen, NFFT))
+        first = int(round((t_sub if t_sub < NFFT // 2 else t_sub - NFFT) - latest))
+        near = first + np.arange(-int(fs / fc), int(fs / fc) + 1)
+        bulk = int(near[np.argmax(np.abs(signal.hilbert(np.fft.irfft(cross, NFFT)))[near % NFFT])])
         d, flip = align(lower * np.exp(2j * np.pi * f * bulk / fs), upper, f, fs, fc)
         late = bulk + d  # > 0: the subwoofer arrives later, so the speakers must wait for it
         wait = max(late, 0)
         sub = {"name": "Subwoofer", "channel": config.sub(cfg)["channel"], "device": config.sub_device(cfg),
                "filters": lp, "gains": [round(w["offset"] - sub_offset, 1) for w in work],
                "invert": bool(flip), "delay": int(max(-late, 0))}
+        # room noise (rumble) must not pass for deep bass: the subwoofer is only corrected
+        # down to where it is clearly above the noise floor of its measurement
+        floor = 0.0
+        if meas["irs"].get("noise_sub") is not None and len(meas["irs"]["noise_sub"]):
+            noise_db = _smooth_db(f, np.mean([np.abs(np.fft.rfft(n, NFFT) / mic * 10 ** (g / 20)) ** 2
+                                              for n, g in zip(meas["irs"]["noise_sub"], gains)], axis=0), 1 / 3)
+            hidden = np.where((_smooth_db(f, np.mean([np.abs(h) ** 2 for h in hs], axis=0), 1 / 3) < noise_db + 10)
+                              & (GRID < fc))[0]
+            if len(hidden) and hidden[-1] + 1 < len(GRID):
+                floor = float(GRID[hidden[-1] + 1])
+                if floor > 30:
+                    notes.append(f"Room noise is louder than the subwoofer below {floor:.0f} Hz, so nothing is "
+                                 "corrected there. For deeper correction, measure when it is quieter or allow "
+                                 "a higher subwoofer test level.")
         if sub["delay"] > 0.25 * fs or wait > 0.25 * fs:
             notes.append("The delay between the output devices is unusually long; sound will lag behind video.")
         for spk, w, gain in zip(speakers, work, sub["gains"]):
@@ -295,7 +318,7 @@ def design(cfg, meas, cal=None, verify_irs=None):
             w["fine"], w["coarse"] = _smooth_db(f, power, FINE), _smooth_db(f, power, 1 / 2)
             third, wide = _smooth_db(f, power, 1 / 3), _smooth_db(f, power, 1.0)
             ok = np.where(wide > np.median(third[(GRID >= 200) & (GRID <= 5000)]) - 6)[0]
-            w["f_lo"] = float(tgt["f_min"] or GRID[ok[0]])
+            w["f_lo"] = float(tgt["f_min"] or max(GRID[ok[0]], floor))
 
     curves, eq_peak = [], 0.0
     for spk, w in zip(speakers, work):
@@ -350,6 +373,14 @@ def design(cfg, meas, cal=None, verify_irs=None):
                 mid = (GRID >= 200) & (GRID <= 5000)
                 c["verified"] += float(np.mean((c["predicted"] - c["verified"])[mid]))
                 c["verified_arrival_ms"] = None
+                fc = config.sub(cfg)["crossover"]
+                around = (GRID >= fc / 1.4) & (GRID <= fc * 1.4)
+                missing = float(np.mean((c["predicted"] - c["verified"])[around]))
+                if missing > 2.5 and not any("add up" in n for n in notes):
+                    notes.append(f"Subwoofer and speakers do not add up as predicted around {fc:g} Hz "
+                                 f"({missing:.0f} dB is missing). The delay between the two output devices "
+                                 "was different when the result was measured than when the delay was measured. "
+                                 "Press \"Measure result again\"; if it stays, measure again.")
         curves.append(c)
     return {"fs": fs, "speakers": speakers, "sub": sub, "curves": curves, "freq": GRID, "target": shape,
             "headroom": round(headroom, 1), "warnings": meas.get("warnings", []) + notes}

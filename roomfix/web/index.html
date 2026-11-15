@@ -16,24 +16,24 @@
   <details id="setup" class="card">
     <summary><h2>1 · Setup</h2><span id="setup-summary" class="muted"></span></summary>
     <div class="grid">
-      <label>DAC<select id="output_device"></select></label>
-      <label>Measurement microphone<select id="input_device"></select></label>
-      <label>Mic input channel<input id="input_channel" type="number" min="1" max="64"></label>
-      <label>Mic calibration file
+      <label data-help="The sound device your speakers (or their amplifiers) are connected to. Not the virtual cable.">DAC<select id="output_device"></select></label>
+      <label data-help="A measurement microphone such as a miniDSP UMIK-1. A headset or webcam microphone gives wrong results.">Measurement microphone<select id="input_device"></select></label>
+      <label data-help="Which input of the recording device the microphone uses. 1 for a USB microphone; on an audio interface, the number of the input jack.">Mic input channel<input id="input_channel" type="number" min="1" max="64"></label>
+      <label data-help="The correction file that came with your microphone (for a UMIK-1: download it by serial number from minidsp.com). Use the 90 degree file when the microphone points at the ceiling. Without a file the highest and lowest frequencies are less accurate.">Mic calibration file
         <span class="row"><button id="cal-btn" type="button">Choose file</button>
         <span id="cal-name" class="muted"></span></span>
         <input id="cal-file" type="file" accept=".txt,.cal,.frd,.csv" hidden></label>
-      <label>Playback engine<select id="backend">
+      <label data-help="The program that applies the correction to everything you play. CamillaDSP is downloaded and run by roomfix and can do everything. Equalizer APO must be installed separately and only suits passive speakers without a subwoofer.">Playback engine<select id="backend">
         <option value="camilladsp">CamillaDSP (required for active crossovers)</option>
         <option value="equalizerapo">Equalizer APO</option></select></label>
-      <label id="capture-wrap">System audio source<select id="capture_device"></select></label>
-      <label>Microphone positions<input id="positions" type="number" min="1" max="9"></label>
-      <label>Loudest allowed test signal (dBFS)<input id="max_level_db" type="number" min="-60" max="0" step="1"></label>
-      <label class="check"><input id="autostart" type="checkbox"> Start correction with Windows</label>
+      <label id="capture-wrap" data-help="Where roomfix picks up what Windows plays, so that it can correct it and pass it on to the DAC. Install VB-CABLE (free, vb-audio.com/Cable), make &quot;CABLE Input&quot; the default output in the Windows sound settings, and select &quot;CABLE Output&quot; here. roomfix selects it for you when it finds it.">System audio source<select id="capture_device"></select></label>
+      <label data-help="1 corrects for one seat. With 3 to 5 positions around the listening area, roomfix asks you to move the microphone between measurements and the correction suits a whole sofa.">Microphone positions<input id="positions" type="number" min="1" max="9"></label>
+      <label data-help="A hard limit: roomfix starts very quietly and never plays a test signal above this level. 0 is the loudest the DAC can play. If roomfix reports that it hears too little, raise this or turn the amplifier up.">Loudest allowed test signal (dBFS)<input id="max_level_db" type="number" min="-60" max="0" step="1"></label>
+      <label class="check" data-help="Starts the playback engine when you log in, so that the correction is always on. roomfix itself does not need to run."><input id="autostart" type="checkbox"> Start correction with Windows</label>
     </div>
     <h3>Speakers</h3>
     <div class="row">
-      <label class="inline">Type<select id="n_ways">
+      <label class="inline" data-help="Passive: each speaker has its own crossover inside and uses one DAC channel. Active: every driver has its own amplifier and DAC channel, and roomfix is the crossover.">Type<select id="n_ways">
         <option value="1">Passive / full range (1 DAC channel each)</option>
         <option value="2">Active 2-way</option>
         <option value="3">Active 3-way</option></select></label>
@@ -43,11 +43,11 @@
     <div id="xo-setup"></div>
     <h3>Subwoofer</h3>
     <div class="grid">
-      <label class="check"><input id="sub_enabled" type="checkbox"> Use a subwoofer for the bass of all speakers</label>
-      <label class="sub-opt">Connected to<select id="sub_device"></select></label>
-      <label class="sub-opt">Channel<select id="sub_channel"></select></label>
-      <label class="sub-opt">Crossover (Hz)<input id="sub_crossover" type="number" min="30" max="300" step="5"></label>
-      <label class="sub-opt">Loudest allowed subwoofer test signal (dBFS, empty = as above)<input id="sub_max" type="number" min="-60" max="0" step="1"></label>
+      <label class="check" data-help="The subwoofer plays everything below the crossover frequency, the speakers everything above it. Level, delay and polarity are set by measurement."><input id="sub_enabled" type="checkbox"> Use a subwoofer for the bass of all speakers</label>
+      <label class="sub-opt" data-help="A free channel of the DAC, or a second sound device (for example speakers on the TV over HDMI and the subwoofer on a USB DAC). roomfix measures and removes the delay between the two devices.">Connected to<select id="sub_device"></select></label>
+      <label class="sub-opt" data-help="The channel of that device the subwoofer is connected to.">Channel<select id="sub_channel"></select></label>
+      <label class="sub-opt" data-help="Below this the subwoofer plays, above it the speakers. 80 Hz suits most speakers; small speakers may need 100 to 120 Hz. Turn the subwoofer's own crossover knob to its highest setting or to LFE.">Crossover (Hz)<input id="sub_crossover" type="number" min="30" max="300" step="5"></label>
+      <label class="sub-opt" data-help="The subwoofer has its own amplifier, so it gets its own limit. Empty: the same limit as the speakers.">Loudest allowed subwoofer test signal (dBFS)<input id="sub_max" type="number" min="-60" max="0" step="1"></label>
     </div>
     <p id="sub-note" class="muted" hidden>The subwoofer is on its own output device. roomfix measures the delay between
       the two devices through the playback engine and compensates it. Leave the Windows volume of both devices and the
@@ -60,7 +60,7 @@
     <p class="muted">Put the microphone at ear height in the listening position, pointing at the ceiling. Stay quiet during the sweeps.</p>
     <div class="row">
       <button id="run" class="primary" type="button">Measure and correct</button>
-      <label class="check"><input id="auto_apply" type="checkbox" checked> Apply when finished</label>
+      <label class="check" data-help="Switches the correction on as soon as it has been measured. Without it, look at the result first and press Apply correction."><input id="auto_apply" type="checkbox" checked> Apply when finished</label>
       <button id="identify" type="button">Check wiring</button>
       <button id="cancel" type="button" hidden>Stop</button>
     </div>
@@ -88,20 +88,20 @@
     <div id="charts"></div>
     <h3>Target curve</h3>
     <div class="grid">
-      <label>Preset<select id="preset">
+      <label data-help="The target is the frequency response roomfix aims for. Flat sounds thin in a room; most people prefer some bass lift and gently falling treble.">Preset<select id="preset">
         <option value="">Custom</option>
         <option value="0,0">Flat</option>
         <option value="-0.5,0">Slight downward tilt</option>
         <option value="-0.8,3">Balanced</option>
         <option value="-1,6">Warm</option></select></label>
-      <label>Tilt <output id="tilt-o"></output><input id="tilt" type="range" min="-2" max="1" step="0.1"></label>
-      <label>Bass boost <output id="bass_boost-o"></output><input id="bass_boost" type="range" min="-3" max="10" step="0.5"></label>
-      <label>Bass boost below <output id="bass_freq-o"></output><input id="bass_freq" type="range" min="40" max="300" step="5"></label>
-      <label>Max boost <output id="max_boost-o"></output><input id="max_boost" type="range" min="0" max="12" step="0.5"></label>
-      <label>Max cut <output id="max_cut-o"></output><input id="max_cut" type="range" min="0" max="24" step="1"></label>
-      <label>Filters per speaker <output id="n_filters-o"></output><input id="n_filters" type="range" min="1" max="20" step="1"></label>
-      <label>Correct from (Hz, empty = auto)<input id="f_min" type="number" min="10" max="20000"></label>
-      <label>Correct up to (Hz, empty = auto)<input id="f_max" type="number" min="10" max="20000"></label>
+      <label data-help="How much the response falls (negative) or rises towards the treble, per octave.">Tilt <output id="tilt-o"></output><input id="tilt" type="range" min="-2" max="1" step="0.1"></label>
+      <label data-help="Extra level for the bass.">Bass boost <output id="bass_boost-o"></output><input id="bass_boost" type="range" min="-3" max="10" step="0.5"></label>
+      <label data-help="The bass boost applies below this frequency.">Bass boost below <output id="bass_freq-o"></output><input id="bass_freq" type="range" min="40" max="300" step="5"></label>
+      <label data-help="The most roomfix may amplify a dip. Boost costs amplifier power and volume headroom; deep narrow dips are never filled.">Max boost <output id="max_boost-o"></output><input id="max_boost" type="range" min="0" max="12" step="0.5"></label>
+      <label data-help="The most roomfix may reduce a peak.">Max cut <output id="max_cut-o"></output><input id="max_cut" type="range" min="0" max="24" step="1"></label>
+      <label data-help="More filters follow the target more closely; fewer give a gentler correction.">Filters per speaker <output id="n_filters-o"></output><input id="n_filters" type="range" min="1" max="20" step="1"></label>
+      <label data-help="Nothing is corrected below this frequency. Empty: from where the speaker starts to play.">Correct from (Hz, empty = auto)<input id="f_min" type="number" min="10" max="20000"></label>
+      <label data-help="Nothing is corrected above this frequency. Enter for example 500 to correct only the room and leave the character of the speakers alone.">Correct up to (Hz, empty = auto)<input id="f_max" type="number" min="10" max="20000"></label>
     </div>
     <details><summary>Custom curve</summary>
       <p class="muted">One "frequency dB" pair per line, added on top of the settings above. Example: <code>3000 -2</code>.
@@ -113,6 +113,7 @@
   </section>
 </main>
 <div id="tip" class="tip" hidden></div>
+<div id="help" class="help" role="tooltip" hidden></div>
 <script src="app.js"></script>
 </body>
 </html>
