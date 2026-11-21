@@ -58,6 +58,20 @@ def _png(img):
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+def app_icon(size):
+    """PNG of the phone page's home-screen icon: the loudspeaker on a dark tile. It stays
+    inside the middle of the tile, which a phone keeps when it rounds the icon off."""
+    inner = int(size * 0.64)
+    picture = _picture("on", inner).astype(float)
+    tile = np.zeros((size, size, 4))
+    tile[...] = (17, 19, 21, 255)
+    at = (size - inner) // 2
+    part = tile[at:at + inner, at:at + inner]
+    alpha = picture[..., 3:] / 255
+    part[..., :3] = picture[..., :3] * alpha + part[..., :3] * (1 - alpha)
+    return _png(np.round(tile).astype(np.uint8))
+
+
 def icon_file(state, sizes=(16, 20, 24, 32, 48)):
     """Windows .ico data of the icon for a state."""
     images = [_png(_picture(state, s)) for s in sizes]
@@ -153,12 +167,22 @@ class Tray:
         self.sup, self.hwnd, self.ready = sup, None, threading.Event()
         self.osd = self.taskbar_created = None
         self.thread = threading.Thread(target=self._guarded, daemon=True)
+        sup.listeners.append(self._changed_elsewhere)
 
     def start(self):
         self.thread.start()
 
+    def _changed_elsewhere(self):
+        """The volume, mute or power was changed through the API (the phone page, a hotkey
+        script): show it like a volume key does. Runs in the server's thread; the window's
+        own thread draws."""
+        if self.hwnd:
+            self.u.PostMessageW(self.hwnd, WM_OSD, 0, 0)
+
     def close(self):
         """Remove the icon and give the volume keys back to Windows."""
+        if self._changed_elsewhere in self.sup.listeners:
+            self.sup.listeners.remove(self._changed_elsewhere)
         if self.ready.wait(5) and self.hwnd:
             self.u.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
             self.thread.join(3)
@@ -210,6 +234,8 @@ class Tray:
                 steps = KEYS[wparam][2]
                 self._act(self.sup.set_mute if steps is None
                           else lambda: self.sup.set_volume(delta=steps * self.sup.status()["step_db"]))
+            elif msg == WM_OSD:
+                self._act(lambda: None)
             elif msg == WM_TIMER and wparam == 1:
                 self._refresh()
             elif msg == WM_TIMER and wparam == 2:

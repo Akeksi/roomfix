@@ -2,6 +2,8 @@
 import json
 import os
 import shutil
+import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -185,6 +187,9 @@ def test_tray_icon_tells_the_state(tmp_path, monkeypatch):
         ico = tray.icon_file(state)
         assert ico[:4] == bytes([0, 0, 1, 0]) and ico[4] >= 3 and b"PNG" in ico
     assert tray.icon_file("on") != tray.icon_file("muted")
+    for size in (192, 512):  # and the phone page has one for the home screen
+        png = tray.app_icon(size)
+        assert png[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", png[16:24]) == (size, size)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the notification area is a Windows thing")
@@ -198,6 +203,13 @@ def test_tray_icon_appears_and_goes_away(tmp_path, monkeypatch):
     assert all(icon.icons.values())  # Windows could load the generated icon
     icon._show("-20.0 dB", 0.66)  # the volume display can be drawn
     time.sleep(0.3)
+    sup.set_volume(value=-24)
+    sup.notify()  # as after a change from the phone: shown like a volume key
+    for _ in range(50):
+        if icon.osd_text == "-24.0 dB":
+            break
+        time.sleep(0.05)
+    assert icon.osd_text == "-24.0 dB" and icon.osd_bar == pytest.approx(0.6)
     world.run(sup, 2)
     shown = {}
     icon.u.AppendMenuW = lambda menu, flags, ident, text: shown.update({text: ident}) or 1
@@ -207,7 +219,7 @@ def test_tray_icon_appears_and_goes_away(tmp_path, monkeypatch):
     assert "Correction on" in shown and "Stop correction and close" in shown and "Volume" in shown
     assert any("LG TV (HDMI): running" in text for text in shown if text)
     icon.close()
-    assert not icon.thread.is_alive()
+    assert not icon.thread.is_alive() and not sup.listeners
 
 
 def test_http_api_and_shutdown(tmp_path, monkeypatch):
@@ -238,6 +250,152 @@ def test_http_api_and_shutdown(tmp_path, monkeypatch):
     assert not thread.is_alive() and not (tmp_path / "engine.json").exists()
     assert all(p.code is not None for p in world.by_port.values())  # the engines were stopped too
     assert supervisor.request("/api/status") is None
+
+
+PHONE_HOST = "living-room-pc.tail1234.ts.net"  # what `tailscale serve` passes on from the phone
+
+
+def test_only_this_computer_and_its_tailscale_name_are_served():
+    for host in ("127.0.0.1", "127.0.0.1:8136", "localhost", "LOCALHOST:8136", PHONE_HOST,
+                 PHONE_HOST + ":443", PHONE_HOST.upper(), PHONE_HOST + "."):
+        assert supervisor.allowed_host(host), host
+    # a website that points its own name at 127.0.0.1 (DNS rebinding) sends its own name
+    for host in (None, "", "evil.example", "127.0.0.1.evil.example", "localhost.evil.example",
+                 PHONE_HOST + ".evil.example", "evil.example/.ts.net", "ts.net", ".ts.net", "a_b.ts.net",
+                 "192.168.1.20:8136", "[::1]:8136", "127.0.0.1:8136:1", PHONE_HOST + ":http", " 127.0.0.1"):
+        assert not supervisor.allowed_host(host), host
+    assert supervisor.local_host("127.0.0.1:8136") and supervisor.local_host("localhost")
+    assert not supervisor.local_host(PHONE_HOST)
+
+
+def _serve(tmp_path, monkeypatch):
+    """A supervisor with its API, and a way to call it under any Host name."""
+    world, sup = setup(tmp_path, monkeypatch)
+    thread = threading.Thread(target=supervisor.run, args=(sup, 0), daemon=True)
+    thread.start()
+    for _ in range(50):
+        if supervisor.request("/api/status"):
+            break
+        time.sleep(0.1)
+    port = json.loads((tmp_path / "engine.json").read_text())["port"]
+
+    def call(path, body=None, host=PHONE_HOST, kind="application/json"):
+        """(HTTP status, content type, reply)"""
+        data = body if isinstance(body, bytes) or body is None else json.dumps(body).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
+                                     headers={"Host": host, "Content-Type": kind})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as reply:
+                code, kind, raw = reply.status, reply.headers["Content-Type"], reply.read()
+        except urllib.error.HTTPError as exc:
+            code, kind, raw = exc.code, exc.headers["Content-Type"], exc.read()
+        return code, kind, json.loads(raw) if kind == "application/json" else raw
+
+    return world, sup, thread, call
+
+
+def test_phone_page_works_through_tailscale_serve(tmp_path, monkeypatch):
+    world, sup, thread, call = _serve(tmp_path, monkeypatch)
+    try:
+        for host in ("127.0.0.1", PHONE_HOST):
+            code, kind, page = call("/", host=host)
+            assert code == 200 and kind.startswith("text/html") and b"/api/volume" in page
+        code, _, manifest = call("/manifest.webmanifest")
+        assert code == 200 and json.loads(manifest)["start_url"] == "/"
+        for icon in json.loads(manifest)["icons"]:  # installable on the home screen
+            code, kind, png = call(icon["src"])
+            assert code == 200 and kind == "image/png" and png[:4] == b"\x89PNG"
+        code, _, status = call("/api/status")
+        assert code == 200 and status["enabled"] is True and len(status["engines"]) == 2
+        assert call("/nothing")[0] == 404 and call("/../supervisor.py")[0] == 404
+        # nothing at all for a website that points its own name at this computer
+        assert call("/", host="evil.example")[0] == 403
+        assert call("/api/status", host="evil.example")[0] == 403
+    finally:
+        supervisor.stop()
+        thread.join(10)
+
+
+def test_phone_api_is_idempotent_and_tells_the_tray(tmp_path, monkeypatch):
+    world, sup, thread, call = _serve(tmp_path, monkeypatch)
+    told = []
+    sup.listeners.append(lambda: told.append(sup.status()["volume"]))
+    try:
+        # the same request twice (the phone sends it again when the network dropped the
+        # reply) gives the same result: absolute volume, mute on or off
+        for _ in range(2):
+            assert call("/api/volume", {"value": -25})[2]["volume"] == -25
+            assert call("/api/mute", {"mute": True})[2]["mute"] is True
+        code, _, status = call("/api/volume", {"value": -23, "unmute": True})  # "+" on the phone
+        assert code == 200 and status["volume"] == -23 and status["mute"] is False
+        assert call("/api/volume", {"value": -25})[2]["mute"] is False  # "−" leaves mute alone
+        assert call("/api/power", {"on": False})[2]["enabled"] is False
+        assert call("/api/power", {"on": True})[2]["enabled"] is True
+        assert told == [-25, -25, -25, -25, -23, -25, -25, -25]  # the tray shows every change
+        assert call("/api/restart", {})[0] == 200
+        assert sup._restart is True
+        del told[:]
+        # refused, and nothing changes:
+        assert call("/api/volume", {"value": 0}, host="evil.example")[0] == 403  # another website
+        assert call("/api/volume", b'{"value": 0}', kind="text/plain")[0] == 403  # a form post
+        assert call("/api/volume", b'{"value": NaN}')[0] == 400
+        assert call("/api/volume", {"value": True})[0] == 400
+        assert call("/api/volume", {"value": "loud"})[0] == 400
+        assert call("/api/volume", {})[0] == 400
+        assert call("/api/volume", [0])[0] == 400
+        assert call("/api/mute", {"mute": "yes"})[0] == 400
+        assert call("/api/power", {"on": "off"})[0] == 400
+        assert call("/api/quit", {})[0] == 403  # the phone could not start it again
+        status = call("/api/status")[2]
+        assert status["volume"] == -25 and status["mute"] is False and status["enabled"] is True
+        assert told == [] and thread.is_alive()
+    finally:
+        supervisor.stop()  # from this computer it may quit
+        thread.join(10)
+    assert not thread.is_alive()
+
+
+def test_api_keeps_its_port_for_tailscale_serve(tmp_path, monkeypatch):
+    handler = supervisor._handler(setup(tmp_path, monkeypatch)[1])
+    port = supervisor._free_ports(1)[0]
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", port))  # the supervisor before this one, still closing
+    threading.Timer(0.4, holder.close).start()
+    server = supervisor._bind(handler, port, tries=40, pause=0.05)
+    assert server.server_address[1] == port  # waited for it
+    other = supervisor._bind(handler, port, tries=2, pause=0)  # taken for good: any free port
+    assert other.server_address[1] not in (0, port)
+    server.server_close()
+    other.server_close()
+
+
+def test_status_is_asked_again_when_the_connection_is_reset(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    (tmp_path / "engine.json").write_text(json.dumps({"port": 8136, "pid": 1, "started": time.time()}))
+    calls = []
+
+    class Reply:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"volume": -3}'
+
+    def urlopen(req, timeout=None):
+        calls.append(req.data)
+        if len(calls) < 3:
+            raise urllib.error.URLError(ConnectionResetError(10054, "reset by a network filter"))
+        return Reply()
+
+    monkeypatch.setattr(supervisor.urllib.request, "urlopen", urlopen)
+    assert supervisor.request("/api/status") == {"volume": -3}
+    assert len(calls) == 3
+    del calls[:]
+    assert supervisor.request("/api/mute", {}) is None  # a toggle is not sent twice
+    assert len(calls) == 1 and (tmp_path / "engine.json").exists()
 
 
 def test_roomfix_page_shows_and_sets_the_volume(tmp_path, monkeypatch):

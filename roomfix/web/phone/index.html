@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>roomfix</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="theme-color" content="#111315">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<style>
+  :root {
+    --page: #f4f4f1; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --line: #e1e0d9;
+    --on: #13865f; --on-soft: #dcf1e8; --mute: #b56d0c; --mute-soft: #f8ead2; --bad: #c43434; --bad-soft: #f7dddd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #111315; --surface: #1b1e21; --ink: #f0efec; --ink2: #a9a8a1; --line: #2c2f33;
+      --on: #3cbe8c; --on-soft: #183a2e; --mute: #eba032; --mute-soft: #3d2f17; --bad: #f07272; --bad-soft: #432121;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+         font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+                  max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+  main { max-width: 480px; margin: 0 auto; display: grid; gap: 16px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink2); margin: 0 0 8px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 20px; padding: 20px; }
+  .chip { font-size: 14px; font-weight: 600; padding: 4px 12px; border-radius: 99px; white-space: nowrap;
+          background: var(--line); color: var(--ink2); }
+  .chip.on { background: var(--on-soft); color: var(--on); }
+  .chip.muted { background: var(--mute-soft); color: var(--mute); }
+  .chip.waiting { background: var(--bad-soft); color: var(--bad); }
+  .volume { text-align: center; }
+  .db { font-size: 64px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -2px; line-height: 1.1; }
+  .db small { font-size: 22px; font-weight: 500; color: var(--ink2); letter-spacing: 0; }
+  .is-muted .db span { color: var(--ink2); text-decoration: line-through; text-decoration-thickness: 3px; }
+  .note { color: var(--ink2); font-size: 14px; min-height: 20px; margin: 2px 0 0; }
+  input[type=range] { width: 100%; height: 44px; margin: 10px 0 6px; accent-color: var(--on); }
+  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 16px; color: var(--ink); cursor: pointer;
+           background: var(--on-soft); min-height: 64px; font-size: 26px; touch-action: manipulation; }
+  button:active:not(:disabled) { transform: scale(.97); }
+  button:disabled { opacity: .4; cursor: default; }
+  #mute { font-size: 17px; }
+  #mute.on { background: var(--mute); color: #fff; }
+  .off .volume { opacity: .55; }
+  .engine { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 10px 0;
+            border-top: 1px solid var(--line); }
+  .engine:first-of-type { border-top: 0; padding-top: 2px; }
+  .engine .name { overflow-wrap: anywhere; }
+  .engine .detail { color: var(--ink2); font-size: 13px; overflow-wrap: anywhere; }
+  .engine .chip { font-size: 13px; font-weight: 500; }
+  .engine .chip.running { background: var(--on-soft); color: var(--on); }
+  .actions { display: grid; gap: 10px; margin-top: 14px; }
+  .actions button { font-size: 16px; min-height: 48px; background: transparent; border: 1px solid var(--line); }
+  .actions button.primary { background: var(--on); color: #fff; border-color: var(--on); }
+  /* over the page, so it never moves anything when it comes and goes */
+  .toast { position: fixed; left: 50%; top: max(12px, env(safe-area-inset-top)); transform: translateX(-50%);
+           max-width: calc(100% - 32px); width: max-content; background: var(--bad); color: #fff; padding: 8px 16px;
+           border-radius: 99px; font-size: 14px; text-align: center; opacity: 0; pointer-events: none;
+           transition: opacity .2s; z-index: 10; }
+  .toast.show { opacity: 1; }
+  .stale main { opacity: .5; }  /* what is shown may no longer be true */
+</style>
+</head>
+<body>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<main id="main">
+  <header>
+    <h1>roomfix</h1>
+    <span class="chip" id="state">…</span>
+  </header>
+  <section class="card volume" id="volume-card">
+    <div class="db"><span id="db">–</span> <small>dB</small></div>
+    <input type="range" id="slider" min="-60" max="0" step="0.5" value="-60" aria-label="Volume">
+    <div class="row">
+      <button type="button" id="down" aria-label="Volume down">−</button>
+      <button type="button" id="mute">Mute</button>
+      <button type="button" id="up" aria-label="Volume up">+</button>
+    </div>
+    <p class="note" id="note"></p>
+  </section>
+  <section class="card">
+    <h2>Output devices</h2>
+    <div id="engines"></div>
+    <div class="actions">
+      <button type="button" id="restart">Restart engines</button>
+      <button type="button" id="power">Switch correction off</button>
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const NO_PC = "No connection to roomfix on the PC";
+let S = null;          // the last status from the PC
+let seq = 0, shown = 0; // replies render in the order the requests were made
+let dragging = false, pending = null, failures = 0;
+
+class Refused extends Error {}
+const pause = (ms) => new Promise((done) => setTimeout(done, ms));
+
+// Every change is absolute (a volume in dB, mute true or false), so a request that the
+// network dropped is simply sent again.
+async function api(path, body) {
+  const options = { cache: "no-store" };
+  if (body !== undefined)
+    Object.assign(options, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  for (let attempt = 1; ; attempt++) {
+    const abort = new AbortController(), timer = setTimeout(() => abort.abort(), 4000);
+    try {
+      const reply = await fetch(path, { ...options, signal: abort.signal });
+      const data = await reply.json().catch(() => ({}));
+      if (reply.ok) return data;
+      if (reply.status < 500) throw new Refused(data.error || reply.statusText);
+      if (attempt >= 3) throw new Error(NO_PC);  // e.g. 502 from tailscale serve: roomfix is not running
+    } catch (error) {
+      if (error instanceof Refused || attempt >= 3) throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    await pause(200 * attempt);
+  }
+}
+
+let toastTimer = null;
+function toast(text) {
+  clearTimeout(toastTimer);
+  if (text) $("toast").textContent = text;
+  $("toast").classList.toggle("show", !!text);
+}
+
+// quiet: a status poll; one that fails is normal when the phone wakes up
+async function run(request, quiet = false) {
+  const mine = ++seq;
+  try {
+    const status = await request;
+    failures = 0;
+    toast("");
+    document.body.classList.remove("stale");
+    if (mine >= shown) {
+      shown = mine;
+      render(status);
+    }
+  } catch (error) {
+    if (error instanceof Refused) {
+      toast(error.message);
+      toastTimer = setTimeout(() => toast(""), 4000);
+    } else if (!quiet || ++failures >= 2) {
+      toast(NO_PC);
+      document.body.classList.add("stale");
+    }
+  }
+}
+
+const clamp = (value) => Math.round(Math.max(S.min_db, Math.min(S.max_db, value)) * 10) / 10;
+
+function summary(s) {
+  if (!s.enabled) return ["off", "Off"];
+  if (s.engines.some((e) => e.status === "waiting")) return ["waiting", "Waiting"];
+  return s.mute ? ["muted", "Muted"] : ["on", "On"];
+}
+
+function render(s) {
+  S = s;
+  const [kind, text] = summary(s);
+  $("state").className = "chip " + kind;
+  $("state").textContent = text;
+  document.body.classList.toggle("off", !s.enabled);
+  $("volume-card").classList.toggle("is-muted", s.mute);
+  if (!dragging) {
+    $("db").textContent = s.volume.toFixed(1);
+    $("slider").min = s.min_db;
+    $("slider").max = s.max_db;
+    $("slider").value = s.volume;
+  }
+  $("mute").textContent = s.mute ? "Unmute" : "Mute";
+  $("mute").classList.toggle("on", s.mute);
+  for (const id of ["slider", "down", "mute", "up", "restart"]) $(id).disabled = !s.enabled;
+  $("note").textContent = s.enabled ? "" : "The correction is off: nothing plays through roomfix.";
+  $("power").textContent = s.enabled ? "Switch correction off" : "Switch correction on";
+  $("power").classList.toggle("primary", !s.enabled);
+  $("engines").replaceChildren(...s.engines.map((e) => {
+    const row = document.createElement("div"), left = document.createElement("div");
+    const name = document.createElement("div"), detail = document.createElement("div");
+    const chip = document.createElement("span");
+    row.className = "engine";
+    name.className = "name";
+    name.textContent = e.device || "Engine";
+    detail.className = "detail";
+    detail.textContent = e.detail;
+    chip.className = "chip " + e.status;
+    chip.textContent = e.status;
+    left.append(name, detail);
+    row.append(left, chip);
+    return row;
+  }));
+}
+
+// Shown at once, before the PC answers; replies to older requests no longer change it.
+function optimistic(change) {
+  change(S);
+  render(S);
+  shown = seq + 1;
+}
+
+function setVolume(value, unmute = false) {
+  value = clamp(value);
+  optimistic((s) => { s.volume = value; if (unmute) s.mute = false; });
+  return run(api("/api/volume", unmute ? { value, unmute } : { value }));
+}
+
+$("up").onclick = () => S && setVolume(S.volume + S.step_db, true);
+$("down").onclick = () => S && setVolume(S.volume - S.step_db);
+$("mute").onclick = () => {
+  if (!S) return;
+  const mute = !S.mute;
+  optimistic((s) => { s.mute = mute; });
+  run(api("/api/mute", { mute }));
+};
+$("restart").onclick = () => run(api("/api/restart", {}));
+$("power").onclick = () => {
+  if (!S || (S.enabled && !confirm("Switch the correction off? Nothing plays through roomfix until it is on again.")))
+    return;
+  run(api("/api/power", { on: !S.enabled }));
+};
+
+const slider = $("slider");
+slider.addEventListener("input", () => {
+  dragging = true;
+  $("db").textContent = Number(slider.value).toFixed(1);
+  if (!pending)  // at most a few changes a second while the finger moves
+    pending = setTimeout(() => { pending = null; run(api("/api/volume", { value: Number(slider.value) })); }, 150);
+});
+slider.addEventListener("change", () => {
+  clearTimeout(pending);
+  pending = null;
+  const value = Number(slider.value);
+  optimistic((s) => { s.volume = value; });
+  run(api("/api/volume", { value })).finally(() => { dragging = false; });
+});
+
+const refresh = () => run(api("/api/status"), true);
+refresh();
+setInterval(() => { if (!document.hidden && !dragging) refresh(); }, 2000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

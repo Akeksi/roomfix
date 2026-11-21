@@ -21,7 +21,7 @@ roomfix = "roomfix.__main__:main"
 packages = ["roomfix"]
 
 [tool.setuptools.package-data]
-roomfix = ["web/*"]
+roomfix = ["web/*", "web/phone/*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "roomfix.__version__" }

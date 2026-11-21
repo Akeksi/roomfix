@@ -97,10 +97,20 @@ with Windows", at login. The roomfix page does not need to be open.
   on, muted, waiting for a device, or off. Click it for the menu: mute, volume,
   open roomfix, restart the engines, switch the correction off and on, give the
   volume keys back to Windows, open the log folder, or close it all.
-- Hotkey scripts can use the same local API (the port is in
-  `%APPDATA%oomfix\engine.json`, normally 8136), with `Content-Type: application/json`:
-  `POST /api/volume {"delta": -2}` or `{"value": -20}`, `POST /api/mute {}` (toggle),
+- **Phone.** The background process also serves a page for the phone at
+  `http://127.0.0.1:8136/`: volume slider, ± buttons, mute, on/off and the state of
+  each output device. To reach it from your phone, put the PC and the phone in the
+  same [Tailscale](https://tailscale.com) network and run, once, on the PC:
+  `tailscale serve --bg 8136`. Then open `https://<pc>.<tailnet>.ts.net` on the
+  phone and add it to the home screen. Changes made there show on the PC's screen
+  like a volume key. Only this computer's own names and Tailscale names (`*.ts.net`)
+  are answered, so other websites cannot reach it; "close it all" stays on the PC.
+- Hotkey scripts can use the same API (the port is in
+  `%APPDATA%\roomfix\engine.json`, normally 8136), with `Content-Type: application/json`:
+  `POST /api/volume {"value": -20}` (add `"unmute": true` to unmute too) or
+  `{"delta": -2}`, `POST /api/mute {"mute": true}` (or `{}` to toggle),
   `POST /api/restart {}`, `POST /api/power {"on": false}`, `GET /api/status`.
+  Absolute values are safe to send again when a request got no answer.
 
 ## Active crossovers and driver safety
 
