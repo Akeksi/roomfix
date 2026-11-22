@@ -17,16 +17,26 @@ log = logging.getLogger("roomfix.engine")
 COLORS = {"on": (60, 190, 140), "muted": (235, 160, 50), "waiting": (225, 85, 85), "off": (130, 136, 142)}
 
 
+def source_name(status):
+    """The chosen source, when there is more than one to choose from: "TV App", or ""."""
+    sources = status.get("sources") or {}
+    return sources.get(status.get("source"), "") if len(sources) > 1 else ""
+
+
 def summary(status):
     """(icon, text) for the state of the correction: icon is a key of COLORS."""
     if not status["enabled"]:
         return "off", "roomfix: correction switched off"
+    name = "roomfix" + (f" ({source_name(status)})" if source_name(status) else "")
     waiting = [e["detail"] or e["device"] for e in status["engines"] if e["status"] == "waiting"]
     if waiting:
-        return "waiting", "roomfix: waiting, " + "; ".join(waiting)
+        return "waiting", f"{name}: waiting, " + "; ".join(waiting)
+    silent = [e["detail"] for e in status["engines"] if e.get("signal") is False]
+    if silent:
+        return "waiting", f"{name}: " + "; ".join(silent)
     if status["mute"]:
-        return "muted", f"roomfix: muted ({status['volume']:.1f} dB)"
-    return "on", f"roomfix: {status['volume']:.1f} dB"
+        return "muted", f"{name}: muted ({status['volume']:.1f} dB)"
+    return "on", f"{name}: {status['volume']:.1f} dB"
 
 
 # ---- icons ---------------------------------------------------------------
@@ -88,6 +98,7 @@ WM_LBUTTONUP, WM_RBUTTONUP, WM_APP = 0x202, 0x205, 0x8000
 WM_ICON, WM_OSD = WM_APP + 1, WM_APP + 2
 KEYS = {1: (0, 0xAF, 1.0), 2: (0, 0xAE, -1.0), 3: (0, 0xAD, None),  # id: (modifier, key, steps)
         4: (4, 0xAF, 0.5), 5: (4, 0xAE, -0.5)}                      # 4 = Shift
+SOURCE_ITEMS = {"pc": "PC: what Windows plays", "tv_app": "TV App: what the TV plays (subwoofer only)"}
 MF_STRING, MF_GRAYED, MF_CHECKED, MF_POPUP, MF_SEPARATOR = 0, 1, 8, 0x10, 0x800
 
 
@@ -213,6 +224,7 @@ class Tray:
         self.font = self.g.CreateFontW(int(-20 * self.scale), 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
         self.osd_text, self.osd_bar = "", None
         self.icons, self.shown, self.hot = {}, None, False
+        self.source_seen = self.sup.status().get("source")
         self.taskbar_created = u.RegisterWindowMessageW("TaskbarCreated")
         self._icon(add=True)
         self._refresh()
@@ -303,6 +315,9 @@ class Tray:
         self._refresh()
         if show:
             status = self.sup.status()
+            if status.get("source") != self.source_seen:  # switched: say to what
+                self.source_seen = status.get("source")
+                return self._show(f"Source: {source_name(status) or 'PC'}", None)
             if not status["enabled"]:
                 return self._show("Correction switched off", None)
             level = (status["volume"] - status["min_db"]) / (status["max_db"] - status["min_db"])
@@ -330,6 +345,12 @@ class Tray:
         for eng in status["engines"] if on else []:
             item(top, f"    {eng['device'] or 'engine'}: {eng['detail'] or eng['status']}")
         u.AppendMenuW(top, MF_SEPARATOR, 0, None)
+        sources = status.get("sources") or {}
+        if len(sources) > 1:  # the TV App source is set up
+            for name in sources:
+                item(top, SOURCE_ITEMS.get(name, sources[name]),
+                     lambda name=name: self._act(lambda: self.sup.set_source(name)), checked=status["source"] == name)
+            u.AppendMenuW(top, MF_SEPARATOR, 0, None)
         item(top, "Mute", lambda: self._act(self.sup.set_mute), checked=on and status["mute"], enabled=on)
         for db in (-10, -20, -30, -40):
             item(vol, f"{db} dB", lambda db=db: self._act(lambda: self.sup.set_volume(value=db)))

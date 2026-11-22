@@ -7,6 +7,10 @@ A background process (`roomfix --engine`), started by "Apply correction" and at 
   switched off), it waits until the device is back, also under the new name Windows may
   have given it, and starts the engine again;
 - holds all engines at the same volume and mute, and remembers them;
+- switches between the sources: "PC" (what Windows plays, through the virtual cable, to
+  every output device) and, if set up, "TV App" (the TV plays its own apps on its own
+  speakers and sends the sound over S/PDIF; only the subwoofer's engine runs, from that
+  input). Only the engines of the chosen source run;
 - serves a small HTTP API on 127.0.0.1 for the roomfix page and for hotkey scripts, and
   a page for the phone, which `tailscale serve` can make reachable from the tailnet.
 """
@@ -33,6 +37,10 @@ PORT = 8136  # of the HTTP API, if free. The one in use is in engine.json.
 MIN_DB, MAX_DB = -60.0, 0.0
 STEP_DB = 2.0  # of a volume key; half of it with Shift
 RETRY_MIN, RETRY_MAX = 2.0, 30.0  # seconds before a failed engine is started again
+SOURCES = {"pc": "PC", "tv_app": "TV App"}
+SIGNAL_DB = -80.0  # a peak above this on the S/PDIF input is sound
+QUIET_S = 10.0  # seconds without sound before "no signal" is shown
+NO_SIGNAL = "no sound from the TV: is it playing, with its optical output set to PCM?"
 log = logging.getLogger("roomfix.engine")
 
 
@@ -55,23 +63,41 @@ def _spawn(path, port, volume, mute):
                             creationflags=0x08000000 if sys.platform == "win32" else 0)  # no window
 
 
+_listed = {"at": -1e9, "devices": None}
+
+
+def _connected(kind):
+    """Names of the devices of a kind ("outputs", "inputs") connected right now, or None if
+    they cannot be listed. One listing serves both kinds for a second: it is slow."""
+    if time.monotonic() - _listed["at"] > 1.0:
+        try:
+            from . import audio
+            _listed["devices"] = audio.list_devices(fresh=True)
+        except Exception:
+            _listed["devices"] = None
+        _listed["at"] = time.monotonic()
+    return [dev["name"] for dev in (_listed["devices"] or {}).get(kind, [])] or None
+
+
 def _outputs():
-    """Names of the output devices connected right now, or None if they cannot be listed."""
-    try:
-        from . import audio
-        return [dev["name"] for dev in audio.list_devices(fresh=True)["outputs"]] or None
-    except Exception:
-        return None
+    return _connected("outputs")
+
+
+def _inputs():
+    return _connected("inputs")
 
 
 class Engine:
     """One CamillaDSP process. Only the supervisor's loop starts and stops it."""
 
-    def __init__(self, sup, path, port):
+    def __init__(self, sup, path, port, listen=False):
         self.sup, self.path, self.port = sup, path, port
         self.proc, self.status, self.detail = None, "stopped", ""
         self.next_try, self.retry, self.started = 0.0, RETRY_MIN, 0.0
         self.sent = None  # (volume, mute) the engine has
+        # listen: tell when no sound arrives (the TV's S/PDIF input; silence on the virtual
+        # cable just means that nothing plays). signal: True, False, or None = not known.
+        self.listen, self.signal, self.heard = listen, None, 0.0
         try:
             self.device = self._playback(self._conf()).get("device") or ""
         except Exception:
@@ -85,20 +111,28 @@ class Engine:
         return conf["devices"]["playback"]
 
     def _missing(self):
-        """The output device, if it is not connected. Follows a device that Windows renamed."""
+        """The output or input device, if it is not connected. Follows a device that Windows
+        renamed ("SPDIF In (2- G5)" to "SPDIF In (3- G5)")."""
         conf = self._conf()
-        play = self._playback(conf)
-        outputs = self.sup.outputs() if play.get("type") == "Wasapi" and play.get("device") else None
-        if outputs is None:
-            return None
-        found = find_device(play["device"], outputs)
-        if found is None:
-            return play["device"]
-        if found != play["device"]:
-            log.info("%s is now called %s", play["device"], found)
-            play["device"] = self.device = found
+        missing, renamed = None, False
+        for key in ("playback", "capture"):
+            dev = conf["devices"].get(key) or {}
+            if dev.get("type") != "Wasapi" or not dev.get("device"):
+                continue
+            # a loopback capture records an output device
+            available = self.sup.outputs() if key == "playback" or dev.get("loopback") else self.sup.inputs()
+            if available is None:
+                continue
+            found = find_device(dev["device"], available)
+            if found is None:
+                missing = missing or dev["device"]
+            elif found != dev["device"]:
+                log.info("%s is now called %s", dev["device"], found)
+                dev["device"], renamed = found, True
+        if renamed:
+            self.device = self._playback(conf).get("device") or ""
             self.path.write_text(yaml.safe_dump(conf, sort_keys=False), encoding="utf-8")
-        return None
+        return missing
 
     def _start(self, now):
         missing = self._missing()
@@ -112,6 +146,7 @@ class Engine:
         volume, mute = self.sup.volume, self.sup.mute
         self.proc = self.sup.spawn(self.path, self.port, volume, mute)
         self.sent, self.started, self.status, self.detail = (volume, mute), now, "starting", ""
+        self.signal, self.heard = None, now
 
     def _failed(self, now, why):
         log.warning("engine for %s %s; next try in %.0f s", self.device or self.path.name, why, self.retry)
@@ -138,7 +173,7 @@ class Engine:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(3)
-        self.status, self.detail = "stopped", ""
+        self.status, self.detail, self.signal = "stopped", "", None
 
     def restart(self, now):
         self.stop()
@@ -165,7 +200,19 @@ class Engine:
         self.status, self.detail = ("starting" if state == "Starting" else "running"), ""
         if now - self.started > 60:
             self.retry = RETRY_MIN
+        if self.listen:
+            self._hear(now)
         self.push()
+
+    def _hear(self, now):
+        """Whether sound arrives at the input. An S/PDIF input is silent when the TV is off or
+        paused, but also when it sends Dolby or DTS instead of PCM, which is easy to miss."""
+        peaks = (self.sup.ask(self.port, {"GetCaptureSignalPeakSince": 2.0}) or {}).get("value")
+        if isinstance(peaks, list) and peaks and max(peaks) > SIGNAL_DB:
+            self.heard = now  # (no answer: as before. A reset connection is not silence.)
+        self.signal = now - self.heard < QUIET_S
+        if not self.signal:
+            self.detail = NO_SIGNAL
 
     def push(self):
         """Give the engine the volume in force, unless it already has it."""
@@ -178,9 +225,13 @@ class Engine:
 
 
 class Supervisor:
-    def __init__(self, files, spawn=_spawn, ask=None, outputs=_outputs, clock=time.monotonic):
+    def __init__(self, files, spawn=_spawn, ask=None, outputs=_outputs, clock=time.monotonic, tv_app=None,
+                 inputs=_inputs):
+        """files: one configuration per output device of the PC source; tv_app: the
+        configuration of the TV App source, if it is set up."""
         self.files = list(files)
-        self.spawn, self.ask, self.outputs, self.clock = spawn, ask or engine._request, outputs, clock
+        self.tv_app = tv_app
+        self.spawn, self.ask, self.outputs, self.inputs, self.clock = spawn, ask or engine._request, outputs, inputs, clock
         self.lock = threading.Lock()  # volume and mute
         self.quit = threading.Event()
         try:
@@ -191,9 +242,19 @@ class Supervisor:
         self.mute = bool(saved.get("mute", False))
         self.enabled = bool(saved.get("enabled", True))  # off: engines stopped, the tray icon stays
         self.keys = bool(saved.get("keys", True))  # the volume keys of the keyboard set this volume
-        self.engines = [Engine(self, path, port) for path, port in zip(self.files, _free_ports(len(self.files)))]
+        ports = _free_ports(len(self.files) + (1 if tv_app else 0))
+        self.groups = {"pc": [Engine(self, path, port) for path, port in zip(self.files, ports)]}
+        if tv_app:
+            self.groups["tv_app"] = [Engine(self, Path(tv_app), ports[-1], listen=True)]
+        # the source chosen last time; PC if the TV App source is no longer set up
+        self.source = saved.get("source") if saved.get("source") in self.groups else "pc"
         self._restart = False
         self.listeners = []  # told when the API changed the volume, mute or power: the tray shows it
+
+    @property
+    def engines(self):
+        """The engines of the chosen source: the ones that run."""
+        return self.groups[self.source]
 
     @staticmethod
     def _volume_file():
@@ -206,16 +267,30 @@ class Supervisor:
         except (TypeError, ValueError):
             return 0.0
 
+    def _all(self):
+        return [eng for group in self.groups.values() for eng in group]
+
     def check(self):
         """One round of the supervisor's loop: look after every engine."""
         now = self.clock()
         restart, self._restart = self._restart, False
-        for eng in self.engines:
-            try:
-                if not self.enabled:
+        source, freed = self.source, False  # (the API may switch the source meanwhile)
+        # First stop what must not run: the engines of the other source hold the same
+        # output devices, which an engine opens for itself alone.
+        for name, group in self.groups.items():
+            if self.enabled and name == source:
+                continue
+            for eng in group:
+                try:
                     if eng.proc is not None or eng.status != "stopped":
-                        eng.restart(now)  # stops it; starts at once when switched on again
-                    continue
+                        eng.restart(now)  # stops it; starts at once when chosen or switched on again
+                        freed = True
+                except Exception:
+                    log.exception("engine stop failed")
+        if not self.enabled or freed:  # give Windows a moment to release the devices
+            return
+        for eng in self.groups[source]:
+            try:
                 if restart:
                     eng.restart(now)
                 eng.check(now)
@@ -223,14 +298,29 @@ class Supervisor:
                 log.exception("engine check failed")
 
     def stop(self):
-        for eng in self.engines:
+        for eng in self._all():
             eng.stop()
 
     def _changed(self):
-        self._volume_file().write_text(json.dumps({"volume": self.volume, "mute": self.mute,
-                                                   "enabled": self.enabled, "keys": self.keys}), encoding="utf-8")
-        for eng in self.engines:
+        self._volume_file().write_text(json.dumps({"volume": self.volume, "mute": self.mute, "enabled": self.enabled,
+                                                   "keys": self.keys, "source": self.source}), encoding="utf-8")
+        for eng in self._all():
             eng.push()
+
+    def set_source(self, name):
+        """Play from the PC ("pc") or from the TV's apps ("tv_app"). The engines of the other
+        source stop, those of this one start, at the volume in force."""
+        if name not in self.groups:
+            if name in SOURCES:
+                raise ValueError(f"{SOURCES[name]} is not set up: choose its input in roomfix's Setup "
+                                 "and apply the correction")
+            raise ValueError(f"no source {name!r}: use one of {', '.join(map(repr, self.groups))}")
+        with self.lock:
+            if name != self.source:
+                log.info("source: %s", SOURCES[name])
+            self.source = name
+            self._changed()
+        return self.status()
 
     def set_enabled(self, on=None):
         """Switch the correction off (engines stopped: no sound through it) or on again."""
@@ -274,9 +364,13 @@ class Supervisor:
                 log.exception("listener failed")
 
     def status(self):
+        """engines: those of the chosen source. signal: False while no sound arrives at an
+        input that should have it (TV App), else True or None (not known)."""
         return {"volume": self.volume, "mute": self.mute, "min_db": MIN_DB, "max_db": MAX_DB,
                 "enabled": self.enabled, "keys": self.keys, "step_db": STEP_DB,
-                "engines": [{"device": e.device, "status": e.status, "detail": e.detail} for e in self.engines]}
+                "source": self.source, "sources": {name: SOURCES[name] for name in self.groups},
+                "engines": [{"device": e.device, "status": e.status, "detail": e.detail, "signal": e.signal}
+                            for e in self.engines]}
 
 
 def _free_ports(n):
@@ -411,6 +505,10 @@ def _handler(sup):
                     result = sup.restart()
                 elif path == "/api/power":
                     result = sup.set_enabled(_switch(body.get("on")))
+                elif path == "/api/source":
+                    if not isinstance(body.get("name"), str):
+                        raise ValueError('send {"name": "pc"} or {"name": "tv_app"}')
+                    result = sup.set_source(body["name"])
                 elif path == "/api/quit":
                     if not local_host(host):  # from the phone there would be no way to start it again
                         return self._send(403, {"error": "forbidden: quit from this computer"})
@@ -418,7 +516,7 @@ def _handler(sup):
                     result = {"ok": True}
                 else:
                     return self._send(404, {"error": "not found"})
-                if path in ("/api/volume", "/api/mute", "/api/power"):
+                if path in ("/api/volume", "/api/mute", "/api/power", "/api/source"):
                     sup.notify()
                 self._send(200, result)
             except (ValueError, KeyError, TypeError) as exc:
@@ -458,7 +556,8 @@ def run(sup, port=PORT):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     me = {"port": server.server_address[1], "pid": os.getpid(), "started": time.time()}
     _info_file().write_text(json.dumps(me), encoding="utf-8")
-    log.info("looking after %d engine(s), API at http://127.0.0.1:%d", len(sup.engines), me["port"])
+    log.info("looking after %d engine(s), source %s, API at http://127.0.0.1:%d", len(sup._all()),
+             SOURCES[sup.source], me["port"])
     try:
         # engine.json names the supervisor in charge. If it is removed or replaced, this one
         # has been dismissed, even if the request to quit never arrived.
@@ -486,7 +585,7 @@ def main():
     if request("/api/status") is not None or not files:
         return  # already running, or no correction has been applied
     try:
-        sup = Supervisor(files)
+        sup = Supervisor(files, tv_app=next(iter(engine._tv_app_files()), None))
         icon = None
         if sys.platform == "win32":
             from . import tray
@@ -558,7 +657,8 @@ def start(timeout=25.0):
     while time.monotonic() < end:
         time.sleep(0.3)
         status = request("/api/status")
-        if status and all(e["status"] in ("running", "waiting") for e in status["engines"]):
+        if status and all(e["status"] in ("running", "waiting") or e.get("signal") is False
+                          for e in status["engines"]):  # (a TV that is off sends nothing)
             break
     return status
 

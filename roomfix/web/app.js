@@ -74,6 +74,13 @@ function renderSetup() {
   $("#sub_crossover").value = sub.crossover;
   $("#sub_max").value = sub.max_level_db ?? "";
   $("#sub-note").hidden = !(sub.enabled && sub.device);
+  const tv = cfg.tv_app;
+  options($("#tv_device"), [["", "Not used"], ...ins.filter((d) => ![cfg.capture_device, cfg.input_device].includes(d.name))
+    .map((d) => [d.name, d.name])], tv.device);
+  for (const e of document.querySelectorAll(".tv-opt")) e.hidden = !tv.device;
+  $("#tv_delay").value = tv.delay_ms;
+  $("#tv_gain").value = tv.gain_db;
+  $("#tv_invert").checked = tv.invert;
 
   const xo = $("#xo-setup");
   xo.replaceChildren();
@@ -171,6 +178,10 @@ function bindSetup() {
   $("#sub_channel").onchange = (e) => { cfg.sub.channel = +e.target.value; save(); };
   $("#sub_crossover").onchange = (e) => { cfg.sub.crossover = +e.target.value; save(); };
   $("#sub_max").onchange = (e) => { cfg.sub.max_level_db = e.target.value === "" ? null : +e.target.value; save(); };
+  $("#tv_device").onchange = (e) => { cfg.tv_app.device = e.target.value; save(true); };
+  $("#tv_delay").onchange = (e) => { cfg.tv_app.delay_ms = +e.target.value || 0; save(); };
+  $("#tv_gain").onchange = (e) => { cfg.tv_app.gain_db = +e.target.value || 0; save(); };
+  $("#tv_invert").onchange = (e) => { cfg.tv_app.invert = e.target.checked; save(); };
   $("#add-speaker").onclick = () => {
     const used = cfg.speakers.flatMap((s) => s.channels), next = used.length ? Math.max(...used) + 1 : 0;
     cfg.speakers.push({ name: "Speaker " + (cfg.speakers.length + 1), input: cfg.speakers.length % 2,
@@ -342,13 +353,22 @@ function update(state) {
   $("#playback").hidden = !P;
   if (P) {
     const down = P.engines.filter((e) => e.status === "waiting");
+    const silent = P.engines.filter((e) => e.signal === false);
     if (!P.enabled) {
       $("#engine").textContent = "Correction switched off (tray icon)";
       $("#engine").className = "chip bad";
     } else if (down.length) {
       $("#engine").textContent = "Waiting: " + down.map((e) => e.detail || e.device).join("; ");
       $("#engine").className = "chip bad";
+    } else if (silent.length) {
+      $("#engine").textContent = "TV App: " + silent[0].detail;
+      $("#engine").className = "chip bad";
     }
+    const sources = Object.entries(P.sources || {}), pick = $("#source");
+    pick.hidden = sources.length < 2;  // only when the TV App source is set up
+    if (pick.options.length !== sources.length || sources.some(([v], i) => pick.options[i].value !== v))
+      pick.replaceChildren(...sources.map(([v, t]) => el("option", { value: v, textContent: "Source: " + t })));
+    if (document.activeElement !== pick) pick.value = P.source;
     $("#mute").textContent = P.mute ? "Unmute" : "Mute";
     $("#mute").className = P.mute ? "on" : "";
     if (!dragging) {
@@ -359,7 +379,8 @@ function update(state) {
   $("#errors").replaceChildren(...S.errors.map((e) => el("li", { textContent: e })));
   $("#setup-summary").textContent = S.errors.length ? "needs attention"
     : `${S.cfg.speakers.length} × ${S.cfg.ways.length}-way on ${S.cfg.output_device}`
-      + (S.cfg.sub.enabled ? ` + subwoofer${S.cfg.sub.device ? " on " + S.cfg.sub.device : ""}` : "");
+      + (S.cfg.sub.enabled ? ` + subwoofer${S.cfg.sub.device ? " on " + S.cfg.sub.device : ""}` : "")
+      + (S.cfg.sub.enabled && S.cfg.tv_app.device ? `; TV App from ${S.cfg.tv_app.device}` : "");
   for (const id of ["run", "identify", "apply", "verify"]) $("#" + id).disabled = busy || S.errors.length > 0;
   $("#cancel").hidden = !busy;
   $("#job").hidden = !busy;
@@ -408,6 +429,7 @@ function act(path, body, msgEl) {
   $("#apply").onclick = act("/api/apply", null, "#apply-msg");
   $("#bypass").onclick = act("/api/bypass", null, "#apply-msg");
   $("#mute").onclick = act("/api/mute", () => ({ mute: !S.playback.mute }));
+  $("#source").onchange = act("/api/source", () => ({ name: $("#source").value }));
   const vol = $("#volume"), send = () => post("/api/volume", { value: Number(vol.value) }).catch(() => {});
   vol.oninput = () => {  // while dragging: show at once, send at most every 80 ms
     dragging = true;

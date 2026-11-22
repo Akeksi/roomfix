@@ -72,6 +72,43 @@ each speaker together with the subwoofer through the running engines.
   through the running engines and warns if subwoofer and speakers do not add
   up as predicted at the crossover.
 
+### TV App source: the TV's own apps, with the subwoofer
+
+When the TV plays its own apps (streaming, antenna) on its own speakers, the PC
+never sees that sound. If the TV's optical output is connected to the S/PDIF
+input of a sound card on the PC (for example a Sound BlasterX G5), roomfix can
+still add the subwoofer:
+
+1. In Setup, under the subwoofer, choose the **TV's S/PDIF input** and press
+   **Apply correction**. The source switch appears at the top of the page, in
+   the tray icon's menu and on the phone page.
+2. On the TV, set the digital (optical) audio output to **PCM**, not Dolby,
+   DTS or "auto"/bitstream, and keep the TV's speakers on.
+3. Choose the source **TV App**. roomfix stops the engines that play the PC's
+   sound (so the TV is no longer fed by the PC) and runs one engine that plays
+   only the subwoofer, from left and right of the S/PDIF input. Choose **PC**
+   to go back to the usual chain.
+
+In the TV App source the subwoofer gets the measured correction: the speaker
+EQ in the bass, the level and crossover filter, and the polarity. It does not
+get the measured delay, which lines the subwoofer up with the PC's path to the
+TV. The TV's speakers play without waiting for roomfix, so the subwoofer can
+only be later than them: its engine runs with small buffers (256-sample chunks)
+to keep that small, and a rate adjuster follows the TV's clock. **The timing
+between the TV's speakers and the subwoofer is not measured in this source.**
+Set it by ear in Setup: an extra subwoofer delay (0 to 50 ms), the polarity
+(try both with a steady bass line; keep the fuller one) and a level for this
+source only. If the bass lags behind the TV's speakers, the TV's own AV sync
+setting may be able to delay its speakers. Changes apply with **Apply
+correction**.
+
+Volume, mute and on/off are the same for both sources, and the chosen source is
+remembered across restarts. When nothing has arrived at the S/PDIF input for
+10 seconds, the tray icon turns red and the pages say "no sound from the TV":
+the TV is off or paused, or it sends Dolby instead of PCM. The S/PDIF input is
+followed when Windows renames it ("SPDIF In (2- G5)" to "SPDIF In (3- G5)"),
+like the output devices.
+
 Test signals are played in Windows shared mode, so the bit depth and sample
 rate a device is set to do not matter for measuring. In a noisy room, the
 subwoofer is only corrected down to the frequency where it is louder than the
@@ -96,10 +133,11 @@ with Windows", at login. The roomfix page does not need to be open.
 - **Icon in the notification area** (bottom right). Its colour shows the state:
   on, muted, waiting for a device, or off. Click it for the menu: mute, volume,
   open roomfix, restart the engines, switch the correction off and on, give the
-  volume keys back to Windows, open the log folder, or close it all.
+  volume keys back to Windows, open the log folder, or close it all. With the
+  TV App source set up, the menu also switches between PC and TV App.
 - **Phone.** The background process also serves a page for the phone at
-  `http://127.0.0.1:8136/`: volume slider, ± buttons, mute, on/off and the state of
-  each output device. To reach it from your phone, put the PC and the phone in the
+  `http://127.0.0.1:8136/`: volume slider, ± buttons, mute, on/off, the source (if
+  TV App is set up) and the state of each output device. To reach it from your phone, put the PC and the phone in the
   same [Tailscale](https://tailscale.com) network and run, once, on the PC:
   `tailscale serve --bg 8136`. Then open `https://<pc>.<tailnet>.ts.net` on the
   phone and add it to the home screen. Changes made there show on the PC's screen
@@ -109,7 +147,8 @@ with Windows", at login. The roomfix page does not need to be open.
   `%APPDATA%\roomfix\engine.json`, normally 8136), with `Content-Type: application/json`:
   `POST /api/volume {"value": -20}` (add `"unmute": true` to unmute too) or
   `{"delta": -2}`, `POST /api/mute {"mute": true}` (or `{}` to toggle),
-  `POST /api/restart {}`, `POST /api/power {"on": false}`, `GET /api/status`.
+  `POST /api/restart {}`, `POST /api/power {"on": false}`,
+  `POST /api/source {"name": "tv_app"}` (or `"pc"`), `GET /api/status`.
   Absolute values are safe to send again when a request got no answer.
 
 ## Active crossovers and driver safety

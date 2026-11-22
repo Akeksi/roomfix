@@ -30,6 +30,12 @@ DEFAULT = {
     # otherwise another output device (its different latency is measured and compensated).
     "sub": {"enabled": False, "device": "", "channel": 2, "crossover": 80.0,
             "max_level_db": None},  # None = same test level limit as the speakers
+    # "TV App" source: the TV plays its own apps on its own speakers and sends the sound to a
+    # digital (S/PDIF) input. roomfix then runs only the subwoofer, from that input. device ""
+    # = not used. The TV's speakers play at once, so the subwoofer can only be later: the
+    # measured delay is not used, and delay_ms, invert (against the measured polarity) and
+    # gain_db are set by ear.
+    "tv_app": {"device": "", "delay_ms": 0.0, "invert": False, "gain_db": 0.0},
     "target": {
         "tilt": -0.8,               # dB per octave
         "bass_boost": 3.0,          # dB shelf below bass_freq
@@ -63,6 +69,7 @@ def load():
         cfg.update({k: v for k, v in saved.items() if k in DEFAULT})
         cfg["target"] = {**DEFAULT["target"], **cfg["target"]}
         cfg["sub"] = {**DEFAULT["sub"], **cfg["sub"]}
+        cfg["tv_app"] = {**DEFAULT["tv_app"], **cfg["tv_app"]}
     return cfg
 
 
@@ -114,6 +121,15 @@ def sub_device(cfg):
     return s["device"] if s and s["device"] and s["device"] != cfg["output_device"] else None
 
 
+TV_APP_MAX_DELAY_MS = 50.0
+
+
+def tv_app(cfg):
+    """The "TV App" settings, or None when that source is not set up (it needs a subwoofer)."""
+    t = cfg.get("tv_app") or {}
+    return t if t.get("device") and sub(cfg) else None
+
+
 def wiring_key(cfg):
     """Changes whenever the channel assignment changes, forcing a new wiring check."""
     s = sub(cfg)
@@ -153,6 +169,15 @@ def validate(cfg, n_out=None, n_sub=None):
         elif sub_device(cfg) and not cfg["capture_device"]:
             errors.append("Select the system audio source: it is needed to measure the delay "
                           "between the two output devices.")
+    t = tv_app(cfg)
+    if t:
+        if t["device"] == cfg["capture_device"]:
+            errors.append("The TV App input must be the S/PDIF input the TV is connected to, "
+                          "not the system audio source.")
+        if not 0 <= t["delay_ms"] <= TV_APP_MAX_DELAY_MS:
+            errors.append(f"TV App subwoofer delay must be between 0 and {TV_APP_MAX_DELAY_MS:g} ms.")
+        if not -20 <= t["gain_db"] <= 10:
+            errors.append("TV App subwoofer level must be between -20 and +10 dB.")
     if len(set(used)) != len(used):
         errors.append("Each DAC channel can only be used once.")
     if n_out is not None and used and max(used) >= n_out:

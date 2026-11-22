@@ -32,13 +32,18 @@ class Proc:
 class World:
     """A fake computer: output devices, CamillaDSP processes and their websocket API."""
 
-    def __init__(self, outputs):
-        self.outputs, self.now = list(outputs), 0.0
+    def __init__(self, outputs, inputs=()):
+        self.outputs, self.inputs, self.now = list(outputs), list(inputs), 0.0
         self.spawned, self.by_port, self.sent = [], {}, []
         self.state = "Running"
+        self.peak = -20.0  # dBFS of what arrives at the engines' inputs
+        self.clashes = []  # an engine started on a device that another running engine holds
 
     def spawn(self, path, port, volume, mute):
         proc = Proc()
+        proc.device = yaml.safe_load(path.read_text())["devices"]["playback"]["device"]
+        self.clashes += [proc.device for other in self.by_port.values()
+                         if other.code is None and other.device == proc.device]
         self.spawned.append((path.name, volume, mute))
         self.by_port[port] = proc
         return proc
@@ -50,9 +55,15 @@ class World:
         if command == "Exit":
             proc.code = 0
         if isinstance(command, dict):
+            if "GetCaptureSignalPeakSince" in command:
+                return {"result": "Ok", "value": [self.peak, self.peak]}
             self.sent.append((port, command))
             return {"result": "Ok"}
         return {"result": "Ok", "value": {"GetState": self.state, "GetStopReason": "PlaybackError"}.get(command)}
+
+    def running(self):
+        """Devices that running engines play to."""
+        return sorted(p.device for p in self.by_port.values() if p.code is None)
 
     def run(self, sup, seconds):
         for _ in range(int(seconds)):
@@ -74,6 +85,108 @@ def setup(tmp_path, monkeypatch, devices=("LG TV (HDMI)", "USB DAC")):
 
 def statuses(sup):
     return [e["status"] for e in sup.status()["engines"]]
+
+
+SPDIF = "SPDIF In (2–Sound BlasterX G5)"  # as Windows names it: with an en dash
+
+
+def setup_tv(tmp_path, monkeypatch, spdif=SPDIF):
+    """The PC source on a TV and a USB DAC (the subwoofer), and the TV App source: the TV's
+    sound arrives at an S/PDIF input, and only the subwoofer's engine runs."""
+    world, sup = setup(tmp_path, monkeypatch)
+    path = tmp_path / "tvapp.yml"
+    path.write_text(yaml.safe_dump({"devices": {"capture": {"type": "Wasapi", "device": spdif},
+                                                "playback": {"type": "Wasapi", "device": "USB DAC"}}}))
+    world.inputs = ["CABLE Output (VB-Audio Virtual Cable)", spdif]
+    sup = supervisor.Supervisor(sup.files, spawn=world.spawn, ask=world.ask, outputs=lambda: world.outputs,
+                                inputs=lambda: world.inputs, clock=lambda: world.now, tv_app=path)
+    return world, sup
+
+
+def test_tv_app_source_runs_only_the_subwoofer(tmp_path, monkeypatch):
+    world, sup = setup_tv(tmp_path, monkeypatch)
+    status = sup.status()
+    assert status["source"] == "pc" and status["sources"] == {"pc": "PC", "tv_app": "TV App"}
+    world.run(sup, 3)
+    assert world.running() == ["LG TV (HDMI)", "USB DAC"]
+    assert sup.set_source("tv_app")["source"] == "tv_app"
+    world.run(sup, 3)
+    assert world.running() == ["USB DAC"] and world.spawned[-1][0] == "tvapp.yml"
+    assert statuses(sup) == ["running"] and [e["device"] for e in sup.status()["engines"]] == ["USB DAC"]
+    # the volume, mute and on/off are the same for both sources
+    sup.set_volume(value=-24)
+    assert (sup.engines[0].port, {"SetVolume": -24.0}) in world.sent
+    sup.set_source("pc")
+    world.run(sup, 3)
+    assert world.running() == ["LG TV (HDMI)", "USB DAC"] and statuses(sup) == ["running", "running"]
+    assert world.spawned[-2:] == [("camilladsp.yml", -24.0, False), ("camilladsp_2.yml", -24.0, False)]
+    # the subwoofer's DAC is opened for one engine alone: the other source's engine has
+    # always stopped before the next one starts
+    assert world.clashes == []
+    sup.set_source("tv_app")
+    sup.set_enabled(False)
+    world.run(sup, 3)
+    assert world.running() == []
+    sup.set_enabled(True)
+    world.run(sup, 3)
+    assert world.running() == ["USB DAC"]
+
+
+def test_source_survives_a_restart_and_falls_back_to_pc(tmp_path, monkeypatch):
+    world, sup = setup_tv(tmp_path, monkeypatch)
+    sup.set_source("tv_app")
+    sup.set_source("tv_app")  # idempotent
+    again = supervisor.Supervisor(sup.files, spawn=world.spawn, ask=world.ask, outputs=lambda: world.outputs,
+                                  inputs=lambda: world.inputs, tv_app=sup.tv_app)
+    assert again.status()["source"] == "tv_app"  # e.g. after the next login
+    world.run(again, 3)
+    assert world.running() == ["USB DAC"]
+    # a correction applied without the TV App source: back to the PC
+    plain = supervisor.Supervisor(sup.files, spawn=world.spawn, ask=world.ask, outputs=lambda: world.outputs)
+    assert plain.status()["source"] == "pc" and plain.status()["sources"] == {"pc": "PC"}
+    with pytest.raises(ValueError, match="TV App is not set up"):
+        plain.set_source("tv_app")
+    with pytest.raises(ValueError, match="no source"):
+        sup.set_source("radio")
+
+
+def test_renamed_spdif_input_is_followed(tmp_path, monkeypatch):
+    world, sup = setup_tv(tmp_path, monkeypatch)
+    sup.set_source("tv_app")
+    world.inputs = ["CABLE Output (VB-Audio Virtual Cable)"]  # the sound card is unplugged
+    world.run(sup, 5)
+    tv = sup.status()["engines"][0]
+    assert tv["status"] == "waiting" and f"{SPDIF} is not connected" in tv["detail"] and world.running() == []
+    world.inputs.append("SPDIF In (3- Sound BlasterX G5)")  # back, renumbered by Windows
+    world.run(sup, 3)
+    assert statuses(sup) == ["running"] and world.running() == ["USB DAC"]
+    conf = yaml.safe_load((tmp_path / "tvapp.yml").read_text(encoding="utf-8"))
+    assert conf["devices"]["capture"]["device"] == "SPDIF In (3- Sound BlasterX G5)"
+    assert conf["devices"]["playback"]["device"] == "USB DAC"
+
+
+def test_no_sound_from_the_tv_is_shown(tmp_path, monkeypatch):
+    from roomfix import tray
+    world, sup = setup_tv(tmp_path, monkeypatch)
+    world.peak = -1000.0  # nothing arrives: the TV is off, or sends Dolby instead of PCM
+    world.run(sup, 5)
+    assert all(e["signal"] is None for e in sup.status()["engines"])  # silence from the PC is normal
+    assert tray.summary(sup.status())[0] == "on"
+    sup.set_source("tv_app")
+    world.run(sup, 5)
+    assert sup.status()["engines"][0]["signal"] is True  # not yet: the TV may just be quiet
+    world.run(sup, supervisor.QUIET_S)
+    tv = sup.status()["engines"][0]
+    assert tv["status"] == "running" and tv["signal"] is False and "PCM" in tv["detail"]
+    state, text = tray.summary(sup.status())
+    assert state == "waiting" and text.startswith("roomfix (TV App): ") and "PCM" in text and len(text) < 128
+    world.peak = -35.0  # sound
+    world.run(sup, 1)
+    assert sup.status()["engines"][0]["signal"] is True and sup.status()["engines"][0]["detail"] == ""
+    sup.set_volume(value=-20)
+    assert tray.summary(sup.status()) == ("on", "roomfix (TV App): -20.0 dB")
+    sup.set_source("pc")
+    assert tray.summary(sup.status()) == ("on", "roomfix (PC): -20.0 dB")
 
 
 def test_engine_restarts_when_its_device_comes_back(tmp_path, monkeypatch):
@@ -268,9 +381,9 @@ def test_only_this_computer_and_its_tailscale_name_are_served():
     assert not supervisor.local_host(PHONE_HOST)
 
 
-def _serve(tmp_path, monkeypatch):
+def _serve(tmp_path, monkeypatch, make=setup):
     """A supervisor with its API, and a way to call it under any Host name."""
-    world, sup = setup(tmp_path, monkeypatch)
+    world, sup = make(tmp_path, monkeypatch)
     thread = threading.Thread(target=supervisor.run, args=(sup, 0), daemon=True)
     thread.start()
     for _ in range(50):
@@ -355,6 +468,58 @@ def test_phone_api_is_idempotent_and_tells_the_tray(tmp_path, monkeypatch):
     assert not thread.is_alive()
 
 
+def test_source_is_switched_from_the_phone(tmp_path, monkeypatch):
+    world, sup, thread, call = _serve(tmp_path, monkeypatch, setup_tv)
+    told = []
+    sup.listeners.append(lambda: told.append(sup.status()["source"]))
+    try:
+        code, _, page = call("/")
+        assert code == 200 and b"/api/source" in page
+        for _ in range(2):  # sent again after a lost reply: the same result
+            code, _, status = call("/api/source", {"name": "tv_app"})
+            assert code == 200 and status["source"] == "tv_app"
+        assert call("/api/status")[2]["sources"] == {"pc": "PC", "tv_app": "TV App"}
+        assert call("/api/source", {"name": "pc"})[2]["source"] == "pc"
+        assert told == ["tv_app", "tv_app", "pc"]  # the tray shows it
+        del told[:]
+        for bad in ({}, {"name": 1}, {"name": "radio"}, {"name": None}):
+            assert call("/api/source", bad)[0] == 400, bad
+        assert call("/api/source", {"name": "tv_app"}, host="evil.example")[0] == 403
+        assert call("/api/source", b'{"name": "tv_app"}', kind="text/plain")[0] == 403
+        assert call("/api/status")[2]["source"] == "pc" and told == []
+    finally:
+        supervisor.stop()
+        thread.join(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the notification area is a Windows thing")
+def test_tray_menu_switches_the_source(tmp_path, monkeypatch):
+    from roomfix import tray
+    world, sup = setup_tv(tmp_path, monkeypatch)
+    sup.set_keys(False)  # leave the volume keys of this computer alone
+    icon = tray.Tray(sup)
+    icon.start()
+    try:
+        assert icon.ready.wait(10) and icon.hwnd
+        shown = {}
+        icon.u.AppendMenuW = lambda menu, flags, ident, text: shown.update({text: (ident, flags)}) or 1
+        icon.u.TrackPopupMenu = lambda *args: shown[tray.SOURCE_ITEMS["tv_app"]][0]  # the user picks TV App
+        icon._menu()
+        assert sup.status()["source"] == "tv_app" and icon.osd_text == "Source: TV App"
+        assert shown[tray.SOURCE_ITEMS["pc"]][1] & tray.MF_CHECKED  # (it was PC when the menu opened)
+        icon.u.TrackPopupMenu = lambda *args: 0  # closed without a choice
+        icon._menu()
+        assert shown[tray.SOURCE_ITEMS["tv_app"]][1] & tray.MF_CHECKED
+    finally:
+        icon.close()
+
+
+def test_tray_menu_has_no_source_without_tv_app(tmp_path, monkeypatch):
+    from roomfix import tray
+    _, sup = setup(tmp_path, monkeypatch)
+    assert tray.source_name(sup.status()) == "" and tray.summary(sup.status())[1].startswith("roomfix: ")
+
+
 def test_api_keeps_its_port_for_tailscale_serve(tmp_path, monkeypatch):
     handler = supervisor._handler(setup(tmp_path, monkeypatch)[1])
     port = supervisor._free_ports(1)[0]
@@ -421,6 +586,7 @@ def test_roomfix_page_shows_and_sets_the_volume(tmp_path, monkeypatch):
     state = call("/api/volume", {"value": -18})["state"]
     assert state["playback"]["volume"] == -18 and len(state["playback"]["engines"]) == 2
     assert call("/api/mute", {"mute": True})["state"]["playback"]["mute"] is True
+    assert call("/api/source", {"name": "pc"})["state"]["playback"]["source"] == "pc"
     supervisor.stop()
     assert call("/api/state")["playback"] is None
     with pytest.raises(urllib.error.HTTPError):

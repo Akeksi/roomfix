@@ -36,7 +36,8 @@ class App:
     def devices(self):
         if self.demo:
             return {"outputs": [{"name": self.cfg["output_device"], "channels": 8}],
-                    "inputs": [{"name": self.cfg["input_device"], "channels": 1}]}
+                    "inputs": [{"name": self.cfg["input_device"], "channels": 1},
+                               {"name": "Simulated S/PDIF In", "channels": 2}]}
         return audio.list_devices()
 
     def channels(self):
@@ -258,7 +259,7 @@ def make_handler(app):
                     message = app.apply()
                 elif self.path == "/api/bypass":
                     message = engine.bypass(app.cfg)
-                elif self.path in ("/api/volume", "/api/mute"):
+                elif self.path in ("/api/volume", "/api/mute", "/api/source"):
                     engine.set_playback(self.path, body)
                 else:
                     return self._send(404, {"error": "not found"})

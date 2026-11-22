@@ -34,6 +34,53 @@ def _devices(cfg, fs, device, channels, n_in, synced):
     return dev
 
 
+def _processing(design, ways, sub, n_in, min_out=0):
+    """(number of output channels, mixers, filters, pipeline) of one engine: the correction
+    of every speaker, then the drivers this engine plays. ways: all ways of every speaker;
+    sub: the subwoofer (the design's, or one adjusted for another source), or None."""
+    speakers = design["speakers"]
+    filters, pipeline, outs = {}, [], []
+
+    def add(name, flt):
+        if flt["type"] in ("Gain", "Delay"):
+            filters[name] = {"type": flt["type"], "parameters": {k: v for k, v in flt.items() if k != "type"}}
+        else:
+            filters[name] = {"type": "Biquad", "parameters": dict(flt)}
+        return name
+
+    # 1. one channel per speaker, 2. speaker EQ, 3. split to drivers, 4. crossover + delay
+    pipeline.append({"type": "Mixer", "name": "speakers"})
+    for si, spk in enumerate(speakers):
+        names = [add(f"s{si}_eq{i}", flt) for i, flt in enumerate(spk["eq"])]
+        names.append(add(f"s{si}_gain", {"type": "Gain", "gain": spk["gain"]}))
+        pipeline.append({"type": "Filter", "description": f"{spk['name']}: room correction",
+                         "channels": [si], "names": names})
+        if ways:
+            for wi, way in enumerate(spk["ways"]):
+                outs.append((f"s{si}w{wi}", f"{spk['name']} {way['name']}", way,
+                             [{"channel": si, "gain": way["gain"], "inverted": way["invert"]}]))
+    if sub:  # the bass of all speakers
+        outs.append(("sub", sub["name"], sub, [{"channel": si, "gain": g, "inverted": sub["invert"]}
+                                               for si, g in enumerate(sub["gains"])]))
+    pipeline.append({"type": "Mixer", "name": "drivers"})
+    for key, description, way, _ in outs:
+        names = [add(f"{key}_xo{i}", flt) for i, flt in enumerate(way["filters"])]
+        if way["delay"]:
+            names.append(add(f"{key}_delay", {"type": "Delay", "delay": way["delay"], "unit": "samples"}))
+        if names:
+            pipeline.append({"type": "Filter", "description": description,
+                             "channels": [way["channel"]], "names": names})
+    n_out = max(max(way["channel"] for _, _, way, _ in outs) + 1, min_out or 0)
+    mapping = [{"dest": way["channel"], "sources": sources} for _, _, way, sources in outs]
+    mixers = {
+        "speakers": {"channels": {"in": n_in, "out": len(speakers)}, "mapping": [
+            {"dest": si, "sources": [{"channel": s["input"], "gain": 0}]} for si, s in enumerate(speakers)]},
+        "drivers": {"channels": {"in": len(speakers), "out": n_out},
+                    "mapping": sorted(mapping, key=lambda m: m["dest"])},
+    }
+    return n_out, mixers, filters, pipeline
+
+
 def camilladsp_configs(cfg, design, channels=None):
     """CamillaDSP (v4) configurations as [(output device, dict)], one engine per device.
 
@@ -45,52 +92,51 @@ def camilladsp_configs(cfg, design, channels=None):
     devices = [cfg["output_device"]] + ([sub["device"]] if sub and sub["device"] else [])
     result = []
     for device in devices:
-        filters, pipeline, outs = {}, [], []
-
-        def add(name, flt):
-            if flt["type"] in ("Gain", "Delay"):
-                filters[name] = {"type": flt["type"], "parameters": {k: v for k, v in flt.items() if k != "type"}}
-            else:
-                filters[name] = {"type": "Biquad", "parameters": dict(flt)}
-            return name
-
-        # 1. one channel per speaker, 2. speaker EQ, 3. split to drivers, 4. crossover + delay
-        pipeline.append({"type": "Mixer", "name": "speakers"})
-        for si, spk in enumerate(speakers):
-            names = [add(f"s{si}_eq{i}", flt) for i, flt in enumerate(spk["eq"])]
-            names.append(add(f"s{si}_gain", {"type": "Gain", "gain": spk["gain"]}))
-            pipeline.append({"type": "Filter", "description": f"{spk['name']}: room correction",
-                             "channels": [si], "names": names})
-            if device == cfg["output_device"]:
-                for wi, way in enumerate(spk["ways"]):
-                    outs.append((f"s{si}w{wi}", f"{spk['name']} {way['name']}", way,
-                                 [{"channel": si, "gain": way["gain"], "inverted": way["invert"]}]))
-        if sub and (sub["device"] or cfg["output_device"]) == device:  # the bass of all speakers
-            outs.append(("sub", sub["name"], sub, [{"channel": si, "gain": g, "inverted": sub["invert"]}
-                                                   for si, g in enumerate(sub["gains"])]))
-        pipeline.append({"type": "Mixer", "name": "drivers"})
-        for key, description, way, _ in outs:
-            names = [add(f"{key}_xo{i}", flt) for i, flt in enumerate(way["filters"])]
-            if way["delay"]:
-                names.append(add(f"{key}_delay", {"type": "Delay", "delay": way["delay"], "unit": "samples"}))
-            if names:
-                pipeline.append({"type": "Filter", "description": description,
-                                 "channels": [way["channel"]], "names": names})
-        n_out = max(max(way["channel"] for _, _, way, _ in outs) + 1, channels.get(device) or 0)
-        mapping = [{"dest": way["channel"], "sources": sources} for _, _, way, sources in outs]
+        has_sub = sub and (sub["device"] or cfg["output_device"]) == device
+        n_out, mixers, filters, pipeline = _processing(design, device == cfg["output_device"],
+                                                       sub if has_sub else None, n_in, channels.get(device))
         result.append((device, {
             "title": "roomfix",
             "devices": _devices(cfg, design["fs"], device, n_out, n_in, len(devices) > 1),
-            "mixers": {
-                "speakers": {"channels": {"in": n_in, "out": len(speakers)}, "mapping": [
-                    {"dest": si, "sources": [{"channel": s["input"], "gain": 0}]} for si, s in enumerate(speakers)]},
-                "drivers": {"channels": {"in": len(speakers), "out": n_out},
-                            "mapping": sorted(mapping, key=lambda m: m["dest"])},
-            },
+            "mixers": mixers,
             "filters": filters,
             "pipeline": pipeline,
         }))
     return result
+
+
+TV_APP_CHUNK = 256  # small: the TV's own speakers do not wait for the subwoofer
+TV_APP_LEVEL = 512  # playback buffer. Shared-mode capture arrives in 10 ms packets, which it must bridge.
+
+
+def tv_app_config(cfg, design, channels=None):
+    """The engine of the "TV App" source as (output device, dict), or None if it is not set up.
+
+    The TV plays its own apps on its own speakers and sends the sound to an S/PDIF input.
+    Only the subwoofer plays, with the measured correction (speaker EQ in the bass, level,
+    crossover, polarity) from left and right of that input. Not the measured delay: it lines
+    the subwoofer up with the PC's path to the TV. The TV's speakers do not wait for this
+    engine, so the subwoofer is as early as it can be, plus the delay set by ear.
+    """
+    t, sub = config.tv_app(cfg), design.get("sub")
+    if not t or not sub:
+        return None
+    channels, fs = channels or {}, design["fs"]
+    device = sub["device"] or cfg["output_device"]
+    tuned = dict(sub, delay=int(round(float(t["delay_ms"]) * fs / 1000)),
+                 invert=bool(sub["invert"]) != bool(t["invert"]),
+                 gains=[round(g + float(t["gain_db"]), 2) for g in sub["gains"]])
+    n_in = max(2, max(s["input"] for s in design["speakers"]) + 1)  # S/PDIF is stereo
+    n_out, mixers, filters, pipeline = _processing(design, False, tuned, n_in, channels.get(device))
+    devices = {
+        "samplerate": fs, "chunksize": TV_APP_CHUNK, "target_level": TV_APP_LEVEL,
+        # the TV's clock runs the input, the DAC's the output: follow the difference
+        "enable_rate_adjust": True, "resampler": {"type": "AsyncPoly", "interpolation": "Cubic"},
+        "capture": {"type": "Wasapi", "channels": n_in, "device": t["device"]},
+        "playback": {"type": "Wasapi", "channels": n_out, "device": device or None, "exclusive": True},
+    }
+    return device, {"title": "roomfix TV App", "devices": devices, "mixers": mixers, "filters": filters,
+                    "pipeline": pipeline}
 
 
 def camilladsp_config(cfg, design, device_channels=0):
@@ -274,6 +320,15 @@ def _yamls():
     return sorted(config.data_dir().glob("camilladsp*.yml"))
 
 
+def _tv_app_yaml():
+    """Configuration file of the "TV App" source's engine. It exists if that source is set up."""
+    return config.data_dir() / "tvapp.yml"
+
+
+def _tv_app_files():
+    return [_tv_app_yaml()] if _tv_app_yaml().exists() else []
+
+
 def _check(files):
     for path in files:
         check = subprocess.run([str(_exe()), "--check", str(path)], capture_output=True, text=True,
@@ -286,20 +341,26 @@ def correction_start():
     """Start the applied correction: a supervisor in the background, which runs the engines,
     restarts them when a device returns, and holds the volume. Returns a message."""
     from . import supervisor
-    _check(_yamls())
+    _check(_yamls() + _tv_app_files())
     supervisor.switch_on()
     status = supervisor.start()
     if status is None:
         raise RuntimeError("The playback engine could not be started. See engine.log in " + str(config.data_dir()))
-    waiting = [e["detail"] or e["device"] for e in status["engines"] if e["status"] != "running"]
+    tv = status.get("source") == "tv_app"
+    # (from the TV, an engine that waits for sound is not a failure: the TV may be off)
+    waiting = [e["detail"] or e["device"] for e in status["engines"]
+               if e["status"] != "running" and not (tv and e["status"] == "starting")]
     if len(waiting) == len(status["engines"]):
         why = " ".join(waiting)
         hint = "" if "not connected" in why else (" Check that the output devices and the system audio source "
                                                   "are all set to the same sample rate in Windows sound settings.")
         raise RuntimeError(f"CamillaDSP could not start: {why}.{hint} roomfix keeps trying.")
+    active = "Correction is active (CamillaDSP" + (", source TV App: only the subwoofer plays)" if tv else ")")
     if waiting:
-        return "Correction is active (CamillaDSP), but waiting for a device: " + "; ".join(waiting) + "."
-    return "Correction is active (CamillaDSP)."
+        return active + ", but waiting for a device: " + "; ".join(waiting) + "."
+    if any(e.get("signal") is False for e in status["engines"]):
+        return active + ", but there is " + supervisor.NO_SIGNAL
+    return active + "."
 
 
 def camilla_start(files, ports):
@@ -404,11 +465,14 @@ def apply(cfg, design, channels=None):
             return f"Demo: Equalizer APO config written to {config.data_dir() / 'equalizerapo.txt'}"
         _eqapo_write(text)
         return "Correction is active (Equalizer APO)."
-    for old in _yamls():
+    for old in _yamls() + _tv_app_files():
         old.unlink()
     for i, (_, conf) in enumerate(camilladsp_configs(cfg, design, channels)):
         path = _yaml() if i == 0 else _yaml().with_name(f"camilladsp_{i + 1}.yml")
         path.write_text(yaml.safe_dump(conf, sort_keys=False), encoding="utf-8")
+    tv = tv_app_config(cfg, design, channels)
+    if tv:
+        _tv_app_yaml().write_text(yaml.safe_dump(tv[1], sort_keys=False), encoding="utf-8")
     if not WINDOWS:
         return f"Demo: CamillaDSP config written to {_yaml()}"
     if not cfg["capture_device"]:

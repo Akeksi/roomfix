@@ -255,6 +255,108 @@ def test_camilladsp_runs_subwoofer_configs_like_the_simulation(with_sub, tmp_pat
         assert np.abs(y[:n] - expected[:n]).max() < 1e-9
 
 
+# ---- TV App: the TV's own speakers, the subwoofer from an S/PDIF input -------------
+SPDIF = "SPDIF In (2–Sound BlasterX G5)"
+
+
+def tv_cfg(cfg, **tv):
+    return dict(cfg, tv_app=dict(config.DEFAULT["tv_app"], device=SPDIF, **tv))
+
+
+def test_tv_app_config_plays_only_the_corrected_subwoofer(with_sub):
+    audio, _, d = with_sub
+    cfg = tv_cfg(audio.cfg)
+    sub_device = cfg["sub"]["device"] or cfg["output_device"]
+    channels = {cfg["output_device"]: 4, **({sub_device: 2} if cfg["sub"]["device"] else {})}
+    assert engine.camilladsp_configs(cfg, d, channels) == engine.camilladsp_configs(audio.cfg, d, channels)  # PC unchanged
+    device, conf = engine.tv_app_config(cfg, d, channels)
+    assert device == sub_device
+    dev = conf["devices"]
+    assert dev["capture"] == {"type": "Wasapi", "channels": 2, "device": SPDIF}  # shared mode: the TV's format
+    assert dev["playback"]["device"] == (sub_device or None)  # (the simulated DAC has no name)
+    assert dev["playback"]["channels"] == (2 if cfg["sub"]["device"] else 4) and dev["playback"]["exclusive"]
+    assert dev["chunksize"] == 256 and dev["target_level"] <= 512  # little latency: the TV's speakers do not wait
+    assert dev["enable_rate_adjust"] and dev["resampler"]["type"].startswith("Async")  # two clocks
+    assert "adjust_period" not in dev  # (held at one level only to line several engines up)
+    # only the subwoofer is fed; the speakers' drivers are the TV's, roomfix plays none of them
+    assert [m["dest"] for m in conf["mixers"]["drivers"]["mapping"]] == [d["sub"]["channel"]]
+    # the measured correction of the bass, without the delay that lined it up with the PC's path
+    assert d["sub"]["delay"] > 0 or not cfg["sub"]["device"]
+    x = np.random.default_rng(1).standard_normal((FS // 2, 2)) * 0.1
+    want = sum(design.render_sub(dict(d, sub=dict(d["sub"], delay=0)), si, x[:, spk["input"]], FS)
+               for si, spk in enumerate(d["speakers"]))
+    played = engine.simulate(conf, x, FS)
+    assert np.abs(played[:, d["sub"]["channel"]] - want).max() < 1e-9
+    assert np.abs(np.delete(played, d["sub"]["channel"], axis=1)).max() == 0
+    # set by ear: later, the other polarity, louder or quieter
+    tuned = engine.tv_app_config(tv_cfg(audio.cfg, delay_ms=5.0, invert=True, gain_db=-4.0), d)[1]
+    later = sum(design.render_sub(dict(d, sub=dict(d["sub"], delay=240, invert=not d["sub"]["invert"],
+                                                   gains=[g - 4.0 for g in d["sub"]["gains"]])),
+                                  si, x[:, spk["input"]], FS) for si, spk in enumerate(d["speakers"]))
+    assert np.abs(engine.simulate(tuned, x, FS)[:, d["sub"]["channel"]] - later).max() < 1e-9
+
+
+def test_tv_app_needs_a_subwoofer_and_an_input(with_sub):
+    audio, _, d = with_sub
+    assert engine.tv_app_config(audio.cfg, d) is None  # no input chosen
+    assert config.tv_app(audio.cfg) is None
+    no_sub = tv_cfg(dict(audio.cfg, sub=dict(audio.cfg["sub"], enabled=False)))
+    assert config.tv_app(no_sub) is None and engine.tv_app_config(no_sub, dict(d, sub=None)) is None
+
+
+def test_camilladsp_runs_the_tv_app_config_like_the_simulation(with_sub, tmp_path):
+    exe = os.environ.get("CAMILLADSP") or shutil.which("camilladsp")
+    if not exe:
+        pytest.skip("camilladsp binary not available")
+    audio, _, d = with_sub
+    _, c = engine.tv_app_config(tv_cfg(audio.cfg, delay_ms=1.5, invert=True), d)
+    (tmp_path / "check.yml").write_text(yaml.safe_dump(c, sort_keys=False), encoding="utf-8")
+    check = subprocess.run([exe, "--check", str(tmp_path / "check.yml")], capture_output=True, text=True)
+    assert check.returncode == 0, check.stdout + check.stderr  # as generated, devices and all
+    n_out = c["mixers"]["drivers"]["channels"]["out"]
+    x = np.random.default_rng(0).standard_normal((FS, 2)) * 0.1
+    x.astype("<f8").tofile(tmp_path / "in.raw")
+    expected = engine.simulate(c, x, FS)
+    c["devices"] = {"samplerate": FS, "chunksize": 256,
+                    "capture": {"type": "RawFile", "channels": 2, "filename": str(tmp_path / "in.raw"), "format": "F64_LE"},
+                    "playback": {"type": "File", "channels": n_out, "filename": str(tmp_path / "out.raw"), "format": "F64_LE"}}
+    (tmp_path / "c.yml").write_text(yaml.safe_dump(c, sort_keys=False))
+    subprocess.run([exe, str(tmp_path / "c.yml")], check=True, capture_output=True)
+    y = np.fromfile(tmp_path / "out.raw", "<f8").reshape(-1, n_out)
+    n = len(y) - 512
+    assert np.abs(y[:n] - expected[:n]).max() < 1e-9
+
+
+def test_apply_writes_the_tv_app_engine_beside_the_pc_engines(with_sub, tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "WINDOWS", False)  # write the files, start nothing
+    audio, _, d = with_sub
+    engine.apply(tv_cfg(audio.cfg), d)
+    pc = [p.name for p in engine._yamls()]
+    assert pc == (["camilladsp.yml", "camilladsp_2.yml"] if audio.cfg["sub"]["device"] else ["camilladsp.yml"])
+    conf = yaml.safe_load((tmp_path / "tvapp.yml").read_text(encoding="utf-8"))
+    assert conf["devices"]["capture"]["device"] == SPDIF and engine._tv_app_files() == [tmp_path / "tvapp.yml"]
+    engine.apply(audio.cfg, d)  # TV App no longer used: its engine goes
+    assert not (tmp_path / "tvapp.yml").exists() and [p.name for p in engine._yamls()] == pc
+
+
+def test_tv_app_settings_are_checked_and_kept(tmp_path, monkeypatch):
+    cfg = tv_cfg(sub_cfg("Second DAC"))
+    assert config.validate(cfg, n_out=2) == []
+    for key, value, words in (("delay_ms", 80, "delay"), ("delay_ms", -1, "delay"), ("gain_db", 15, "level"),
+                              ("device", cfg["capture_device"], "not the system audio source")):
+        bad = copy.deepcopy(cfg)
+        bad["tv_app"][key] = value
+        assert any(words in e for e in config.validate(bad, n_out=2)), (key, value)
+    # settings saved before TV App existed get its defaults; saved ones are kept
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    old = {k: v for k, v in config.DEFAULT.items() if k != "tv_app"}
+    (tmp_path / "settings.json").write_text(json.dumps(old))
+    assert config.load()["tv_app"] == config.DEFAULT["tv_app"]
+    config.save(dict(config.load(), tv_app={"device": SPDIF, "delay_ms": 3.5}))
+    assert config.load()["tv_app"] == dict(config.DEFAULT["tv_app"], device=SPDIF, delay_ms=3.5)
+
+
 def test_subwoofer_never_played_above_its_own_limit(with_sub):
     audio, _, _ = with_sub
     cfg = audio.cfg

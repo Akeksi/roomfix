@@ -58,6 +58,10 @@
   .engine .detail { color: var(--ink2); font-size: 13px; overflow-wrap: anywhere; }
   .engine .chip { font-size: 13px; font-weight: 500; }
   .engine .chip.running { background: var(--on-soft); color: var(--on); }
+  .sources { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; padding: 4px;
+             border-radius: 18px; background: var(--page); border: 1px solid var(--line); }
+  .sources button { min-height: 52px; font-size: 17px; background: transparent; color: var(--ink2); border-radius: 14px; }
+  .sources button[aria-pressed=true] { background: var(--on-soft); color: var(--on); }
   .actions { display: grid; gap: 10px; margin-top: 14px; }
   .actions button { font-size: 16px; min-height: 48px; background: transparent; border: 1px solid var(--line); }
   .actions button.primary { background: var(--on); color: #fff; border-color: var(--on); }
@@ -86,6 +90,11 @@
       <button type="button" id="up" aria-label="Volume up">+</button>
     </div>
     <p class="note" id="note"></p>
+  </section>
+  <section class="card" id="source-card" hidden>
+    <h2>Source</h2>
+    <div class="sources" id="sources" role="group" aria-label="Source"></div>
+    <p class="note" id="source-note"></p>
   </section>
   <section class="card">
     <h2>Output devices</h2>
@@ -165,7 +174,29 @@ const clamp = (value) => Math.round(Math.max(S.min_db, Math.min(S.max_db, value)
 function summary(s) {
   if (!s.enabled) return ["off", "Off"];
   if (s.engines.some((e) => e.status === "waiting")) return ["waiting", "Waiting"];
+  if (s.engines.some((e) => e.signal === false)) return ["waiting", "No signal"];
   return s.mute ? ["muted", "Muted"] : ["on", "On"];
+}
+
+const SOURCE_NOTES = { pc: "What the PC plays, on every output device.",
+                       tv_app: "What the TV's own apps play: the TV's speakers, and roomfix adds the subwoofer." };
+
+function renderSources(s) {
+  const names = Object.keys(s.sources || {});
+  $("source-card").hidden = names.length < 2;  // only when the TV App source is set up
+  if (names.length < 2) return;
+  const buttons = $("sources").children;
+  if (buttons.length !== names.length || [...buttons].some((b, i) => b.dataset.name !== names[i]))
+    $("sources").replaceChildren(...names.map((name) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.name = name;
+      button.textContent = s.sources[name];
+      button.onclick = () => setSource(name);
+      return button;
+    }));
+  for (const button of $("sources").children) button.setAttribute("aria-pressed", button.dataset.name === s.source);
+  $("source-note").textContent = SOURCE_NOTES[s.source] || "";
 }
 
 function render(s) {
@@ -187,6 +218,7 @@ function render(s) {
   $("note").textContent = s.enabled ? "" : "The correction is off: nothing plays through roomfix.";
   $("power").textContent = s.enabled ? "Switch correction off" : "Switch correction on";
   $("power").classList.toggle("primary", !s.enabled);
+  renderSources(s);
   $("engines").replaceChildren(...s.engines.map((e) => {
     const row = document.createElement("div"), left = document.createElement("div");
     const name = document.createElement("div"), detail = document.createElement("div");
@@ -196,8 +228,9 @@ function render(s) {
     name.textContent = e.device || "Engine";
     detail.className = "detail";
     detail.textContent = e.detail;
-    chip.className = "chip " + e.status;
-    chip.textContent = e.status;
+    const silent = e.signal === false;  // runs, but nothing arrives from the TV
+    chip.className = "chip " + (silent ? "waiting" : e.status);
+    chip.textContent = silent ? "no signal" : e.status;
     left.append(name, detail);
     row.append(left, chip);
     return row;
@@ -225,6 +258,13 @@ $("mute").onclick = () => {
   optimistic((s) => { s.mute = mute; });
   run(api("/api/mute", { mute }));
 };
+// absolute like the volume: sending it twice changes nothing
+function setSource(name) {
+  if (!S || S.source === name) return;
+  optimistic((s) => { s.source = name; });
+  run(api("/api/source", { name }));
+}
+
 $("restart").onclick = () => run(api("/api/restart", {}));
 $("power").onclick = () => {
   if (!S || (S.enabled && !confirm("Switch the correction off? Nothing plays through roomfix until it is on again.")))
