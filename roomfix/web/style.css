@@ -88,3 +88,16 @@ svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nu
   position: fixed; z-index: 6; max-width: 300px; background: var(--surface); color: var(--ink); border: 1px solid var(--axis);
   border-radius: 6px; padding: 8px 12px; font-size: 13px; line-height: 1.4; box-shadow: 0 2px 10px rgba(0, 0, 0, .15);
 }
+.adjust td, .saved td { vertical-align: middle; }
+.adjust input[type=number] { width: 84px; }
+.adjust td.sub { padding-left: 18px; }
+.adjust tr.changed td:first-child { font-weight: 600; }
+.adjust tr.changed td:first-child::after { content: " · changed"; color: var(--s1); font-weight: 500; font-size: 12.5px; }
+.adjust input.changed { border-color: var(--s1); }
+.saved input { width: 100%; min-width: 140px; }
+.saved tr.active td { background: var(--shade); }
+.saved td:first-child { white-space: nowrap; }
+.closed {
+  position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); max-width: calc(100% - 32px); z-index: 7;
+  background: var(--bad); color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px; text-align: center;
+}

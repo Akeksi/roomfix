@@ -424,6 +424,8 @@ def test_web_api(tmp_path, monkeypatch):
     with pytest.raises(urllib.error.HTTPError):  # other websites cannot trigger actions
         call("/api/run", {"action": "measure"}, headers={})
     app.cfg["wiring_confirmed"] = config.wiring_key(app.cfg)
+    app.cfg["adjust"] = {"speakers": [{"gain": -3}], "sub": {}}  # made for an earlier measurement
+    version = call("/api/state")["settings_version"]
     call("/api/run", {"action": "measure"})
     for _ in range(600):
         state = call("/api/state")
@@ -431,6 +433,9 @@ def test_web_api(tmp_path, monkeypatch):
             break
         time.sleep(0.1)
     assert state["job"]["error"] is None and "Measured and corrected" in state["job"]["result"]
+    # a new measurement starts without the changes by hand; applied, it is kept
+    assert state["cfg"]["adjust"] == config.DEFAULT["adjust"] and state["settings_version"] > version
+    assert [(c["active"], c["editable"]) for c in state["corrections"]] == [(True, True)]
     d = call("/api/design")
     assert len(d["curves"]) == 2 and "verified" in d["curves"][0]
     assert (tmp_path / "camilladsp.yml").exists()
@@ -549,3 +554,215 @@ def test_changed_delay_between_devices_is_reported():
     audio.engine_latency_ms = (150.0, 64.5)  # the subwoofer's device restarts 5.5 ms faster
     bad = design.design(cfg, meas, verify_irs=m.verify(d, meas["levels"]))
     assert any("add up" in n for n in bad["warnings"])
+
+
+# ---- changes by hand, and saved corrections ----------------------------------
+def flat_ways(d):
+    return [w for s in d["speakers"] for w in s["ways"]]
+
+
+def test_changes_by_hand_come_on_top_of_the_measured_values(two_way):
+    _, meas, _ = two_way
+    measured = design.design(config.demo(), meas)
+    cfg = config.demo()
+    cfg["adjust"] = {"speakers": [{"ways": [{}, {"gain": -2, "invert": True}]},  # left tweeter
+                                  {"delay_ms": 1.0, "invert": True}], "sub": {}}  # right speaker
+    d = design.design(cfg, meas)
+    assert d["changes"] == 4
+    # the EQ is fitted without them: it does not undo them
+    assert [s["eq"] for s in d["speakers"]] == [s["eq"] for s in measured["speakers"]]
+    tweeter, before = d["speakers"][0]["ways"][1], measured["speakers"][0]["ways"][1]
+    assert tweeter["gain"] == pytest.approx(before["gain"] - 2) and tweeter["invert"] != before["invert"]
+    right, right_before = d["speakers"][1]["ways"], measured["speakers"][1]["ways"]
+    assert [w["invert"] for w in right] == [not w["invert"] for w in right_before]
+    assert [w["delay"] - b["delay"] for w, b in zip(right, right_before)] == [48, 48]  # 1 ms
+    assert d["speakers"][0]["gain"] == measured["speakers"][0]["gain"]  # (nothing louder: nothing quieter)
+    # the page shows the measured values beside the changes
+    assert d["auto"]["speakers"][0]["ways"][1] == before and d["auto"]["speakers"][1]["ways"] == right_before
+    # predicted: the tweeter 2 dB down, and reversed it no longer adds up with the woofer
+    f, c, c0 = d["freq"], d["curves"][0], measured["curves"][0]
+    treble, crossover = (f > 5000) & (f < 10000), (f > 1800) & (f < 2700)
+    assert np.mean((c["predicted"] - c0["predicted"])[treble]) == pytest.approx(-2, abs=0.5)
+    assert np.min((c["predicted"] - c0["predicted"])[crossover]) < -6
+    assert np.allclose(c["measured"], c0["measured"])  # "before" stays as measured
+    # a whole speaker reversed or later sounds the same on its own
+    assert np.allclose(d["curves"][1]["predicted"], measured["curves"][1]["predicted"], atol=0.01)
+    # and what is exported is what the chain renders (CamillaDSP is checked against render)
+    conf = engine.camilladsp_config(cfg, d, 8)
+    x = np.random.default_rng(2).standard_normal((FS // 2, 2)) * 0.1
+    y = engine.simulate(conf, x, FS)
+    for spk in d["speakers"]:
+        ref = design.render(spk, x[:, spk["input"]], FS)
+        for wi, way in enumerate(spk["ways"]):
+            assert np.abs(y[:, way["channel"]] - ref[:, wi]).max() < 1e-9
+
+
+def test_louder_or_earlier_by_hand_never_clips_or_plays_too_soon(two_way):
+    _, meas, _ = two_way
+    measured = design.design(config.demo(), meas)
+    cfg = config.demo()
+    # the right woofer, which needs no delay as measured, 3 dB louder and 0.5 ms earlier
+    assert flat_ways(measured)[2]["delay"] == 0
+    cfg["adjust"] = {"speakers": [{}, {"ways": [{"gain": 3, "delay_ms": -0.5}]}], "sub": {}}
+    d = design.design(cfg, meas)
+    assert d["shift"] == 3 and any("3.0 dB quieter" in w for w in d["warnings"])
+    for s, s0 in zip(d["speakers"], measured["speakers"]):
+        assert s["gain"] == pytest.approx(s0["gain"] - 3)  # everything quieter, so nothing clips...
+    assert flat_ways(d)[2]["gain"] == pytest.approx(flat_ways(measured)[2]["gain"] + 3)  # ...but this one
+    # it cannot play before its sound arrives: all the others wait 0.5 ms longer instead
+    delays, before = [w["delay"] for w in flat_ways(d)], [w["delay"] for w in flat_ways(measured)]
+    assert delays[2] == 0 and [a - b for a, b in zip(delays, before)] == [24, 24, 0, 24]
+
+
+def test_subwoofer_changed_by_hand_but_the_tv_app_keeps_its_own(with_sub):
+    audio, meas, _ = with_sub
+    measured = design.design(audio.cfg, meas)
+    cfg = tv_cfg(copy.deepcopy(audio.cfg), delay_ms=2.0)
+    cfg["adjust"] = {"speakers": [], "sub": {"gain": -3, "delay_ms": 2.0, "invert": True}}
+    d = design.design(cfg, meas)
+    sub, before = d["sub"], measured["sub"]
+    assert sub["gains"] == pytest.approx([g - 3 for g in before["gains"]]) and sub["invert"] != before["invert"]
+    assert sub["delay"] - before["delay"] == 96  # 2 ms
+    # predicted: 3 dB less subwoofer, and reversed it no longer adds up with the speakers
+    f, c, c0 = d["freq"], d["curves"][0], measured["curves"][0]
+    deep = (f > 35) & (f < 50)
+    assert np.mean((c["bass"]["sub"] - c0["bass"]["sub"])[deep]) == pytest.approx(-3, abs=0.3)
+    fc = cfg["sub"]["crossover"]
+    assert np.min((c["predicted"] - c0["predicted"])[(f > fc / 1.3) & (f < fc * 1.3)]) < -3
+    # the TV App source is set by ear on its own: as measured, not as changed for the PC
+    assert engine.tv_app_config(cfg, d) == engine.tv_app_config(tv_cfg(audio.cfg, delay_ms=2.0), measured)
+
+
+def test_changes_by_hand_are_checked_and_kept(tmp_path, monkeypatch):
+    assert config.adjust_errors({"speakers": [{"gain": 1, "ways": [{"delay_ms": -3}]}], "sub": {"invert": True}}) == []
+    for bad, words in (({"sub": {"gain": 12}}, "level"), ({"speakers": [{"delay_ms": 25}]}, "delay"),
+                       ({"speakers": [{"ways": [{}, {"gain": "loud"}]}]}, "numbers"), ([], "object")):
+        assert any(words in e for e in config.adjust_errors(bad)), bad
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    old = {k: v for k, v in config.DEFAULT.items() if k != "adjust"}  # saved before they existed
+    (tmp_path / "settings.json").write_text(json.dumps(old))
+    assert config.load()["adjust"] == config.DEFAULT["adjust"]
+    adjust = {"speakers": [{"invert": True}], "sub": {"gain": -2.5}}
+    config.save(dict(config.load(), adjust=adjust))
+    assert config.load()["adjust"] == adjust
+
+
+def test_saved_corrections(tmp_path, monkeypatch):
+    from roomfix import corrections
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    live = lambda: sorted(p.name for p in corrections.live_files())
+    write = lambda name, text: (tmp_path / name).write_text(text, encoding="utf-8")
+    # what was applied before there was a history is kept as a preset
+    write("camilladsp.yml", "old: 1\n")
+    write("camilladsp_2.yml", "old: 2\n")
+    write("equalizerapo.txt", "left over from trying Equalizer APO\n")
+    first = corrections.entries()
+    assert [(e["name"], e["active"], e["editable"]) for e in first] == [("Earlier correction", True, False)]
+    assert live() == ["camilladsp.yml", "camilladsp_2.yml"]
+    # each Apply adds one; the same files again add nothing
+    write("measurement.npz", "measured")
+    write("camilladsp.yml", "new: 1\n")
+    (tmp_path / "camilladsp_2.yml").unlink()
+    settings = {"target": {"tilt": -1}, "crossover": None, "adjust": None}
+    new = corrections.record(corrections.live_files(), settings=settings, layout="L",
+                             measurement=tmp_path / "measurement.npz", summary="Warm")
+    assert corrections.record(corrections.live_files()) == new
+    assert [(e["id"] == new, e["active"], e["editable"]) for e in corrections.entries()] == [(True, True, True),
+                                                                                         (False, False, False)]
+    meta = corrections.get(new)
+    assert meta["settings"] == settings and meta["summary"] == "Warm" and meta["layout"] == "L"
+    assert corrections.measurement_file(meta["measurement"]).read_text() == "measured"
+    # back to the earlier one: its files in place, the others gone
+    old = first[0]["id"]
+    corrections.use(old, backend="camilladsp")
+    assert corrections.active() == old and live() == ["camilladsp.yml", "camilladsp_2.yml"]
+    assert (tmp_path / "camilladsp_2.yml").read_text() == "old: 2\n"
+    assert (tmp_path / "equalizerapo.txt").exists()  # (another engine's file is left alone)
+    with pytest.raises(ValueError, match="made for CamillaDSP"):  # with Equalizer APO chosen in Setup
+        corrections.use(old, backend="equalizerapo")
+    # presets: those with a name, and the one in use
+    assert [e["id"] for e in corrections.presets()] == [old]
+    corrections.rename(new, "  Movie   night ")
+    assert [(e["name"], e["active"]) for e in corrections.presets()] == [("Movie night", False),
+                                                                          ("Earlier correction", True)]
+    with pytest.raises(ValueError):
+        corrections.rename(new, "x" * 61)
+    with pytest.raises(ValueError, match="in use"):
+        corrections.delete(old)
+    for bad in ("../settings", "..\\x", "", None, 5, new + "/../.."):
+        with pytest.raises(ValueError):
+            corrections.get(bad)
+    # history: the newest unnamed ones are kept, presets always
+    for i in range(corrections.HISTORY + 3):
+        write("camilladsp.yml", f"history: {i}\n")
+        last = corrections.record(corrections.live_files(), created=2e9 + i)
+    names = [e["name"] for e in corrections.entries()]
+    assert len(names) == corrections.HISTORY + 2 and "Movie night" in names and "Earlier correction" in names
+    assert corrections.active() == last
+    corrections.delete(new)
+    assert "Movie night" not in [e["name"] for e in corrections.entries()]
+    assert not list((tmp_path / "corrections" / "measurements").glob("*.npz"))  # no longer needed
+
+
+def test_first_apply_keeps_the_correction_applied_before(two_way, tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    from roomfix import corrections
+    from roomfix.server import App
+    (tmp_path / "camilladsp.yml").write_text("applied: before the history\n")
+    app = App(demo=True)
+    app.meas = dict(two_way[1], layout=app.layout())
+    app.redesign()
+    app.apply()
+    entries = corrections.entries()
+    assert [(e["name"], e["active"]) for e in entries] == [("", True), ("Earlier correction", False)]
+    corrections.use(entries[1]["id"])
+    assert (tmp_path / "camilladsp.yml").read_text() == "applied: before the history\n"
+
+
+def test_page_keeps_applied_corrections_and_follows_a_switch(two_way, tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    from roomfix import corrections
+    from roomfix.server import App
+    _, meas, _ = two_way
+    app = App(demo=True)
+    app.meas = dict(meas, layout=app.layout())
+    app._save_measurement()
+    app.redesign()
+    app.apply()
+    balanced = corrections.active()
+    state = app.state()
+    assert [(c["active"], c["editable"]) for c in state["corrections"]] == [(True, True)]
+    assert not state["unapplied"] and "Balanced" in state["corrections"][0]["summary"]
+    cfg = copy.deepcopy(app.cfg)
+    cfg["target"]["bass_boost"] = 6.0
+    cfg["adjust"] = {"speakers": [{"ways": [{}, {"invert": True}]}], "sub": {}}
+    app.set_config(cfg)
+    assert app.state()["unapplied"]
+    with pytest.raises(RuntimeError, match="level change"):
+        app.set_config(dict(cfg, adjust={"sub": {"gain": 50}}))
+    app.apply()
+    flipped = corrections.active()
+    assert flipped != balanced and "1 change by hand" in app.state()["corrections"][0]["summary"]
+    # switched elsewhere (the phone): the page takes up that correction's settings
+    version = app.settings_version
+    corrections.use(balanced)
+    state = app.state()
+    assert state["settings_version"] == version + 1 and not state["unapplied"]
+    assert app.cfg["target"]["bass_boost"] == 3.0 and app.cfg["adjust"] == config.DEFAULT["adjust"]
+    assert app.design["changes"] == 0 and app.cfg["correction"] == balanced
+    # from the page, also with another measurement
+    other = dict(meas, layout=app.layout(), levels={k: v - 1 for k, v in meas["levels"].items()})
+    app.meas = other
+    app._save_measurement()
+    app.redesign()
+    app.apply()
+    assert app.meas_id != corrections.get(balanced)["measurement"]
+    app.use_correction(flipped)
+    assert app.cfg["adjust"]["speakers"][0]["ways"][1]["invert"] is True
+    assert app.meas_id == corrections.get(flipped)["measurement"] and app.meas["levels"] == meas["levels"]
+    assert app.design["changes"] == 1 and not app.state()["unapplied"]
+    # one made with another setup plays, but the page says that it cannot show it
+    app.cfg["speakers"][0]["channels"] = [4, 5]
+    app.use_correction(balanced)
+    assert "another setup" in app.state()["correction_note"]
+    assert app.cfg["target"]["bass_boost"] == 6.0  # (the settings were not taken)

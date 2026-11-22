@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 WAY_NAMES = {1: ["Full range"], 2: ["Woofer", "Tweeter"], 3: ["Woofer", "Midrange", "Tweeter"]}
@@ -47,8 +48,15 @@ DEFAULT = {
         "f_max": None,
         "n_filters": 12,
     },
+    # changes by hand on top of the measured values: {"gain": dB, "delay_ms": ms, "invert":
+    # bool} for a whole speaker, each of its drivers ("ways") and the subwoofer. They belong
+    # to the measurement: a new one starts without them.
+    "adjust": {"speakers": [], "sub": {}},
     "wiring_confirmed": "",
+    "correction": "",  # the saved correction these settings belong to (corrections.py)
 }
+ADJUST_DB = (-20.0, 10.0)
+ADJUST_MS = 20.0
 
 
 def data_dir():
@@ -61,6 +69,17 @@ def data_dir():
     return path
 
 
+def replace_file(src, dst):
+    """os.replace, which Windows refuses for a moment while another program reads dst."""
+    for attempt in range(40):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
+
+
 def load():
     cfg = copy.deepcopy(DEFAULT)
     path = data_dir() / "settings.json"
@@ -70,7 +89,33 @@ def load():
         cfg["target"] = {**DEFAULT["target"], **cfg["target"]}
         cfg["sub"] = {**DEFAULT["sub"], **cfg["sub"]}
         cfg["tv_app"] = {**DEFAULT["tv_app"], **cfg["tv_app"]}
+        cfg["adjust"] = {**DEFAULT["adjust"], **(cfg["adjust"] or {})}
     return cfg
+
+
+def adjust_errors(adjust):
+    """Problems with the changes by hand."""
+    if not isinstance(adjust, dict):
+        return ["Changes by hand must be an object."]
+    items = [("Subwoofer", adjust.get("sub"))]
+    for si, spk in enumerate(adjust.get("speakers") or []):
+        items.append((f"Speaker {si + 1}", spk))
+        for wi, way in enumerate((spk or {}).get("ways") or [] if isinstance(spk, dict) else []):
+            items.append((f"Speaker {si + 1}, driver {wi + 1}", way))
+    errors = []
+    for name, item in items:
+        if item in (None, {}):
+            continue
+        try:
+            gain, delay = float(item.get("gain") or 0), float(item.get("delay_ms") or 0)
+        except (AttributeError, TypeError, ValueError):
+            errors.append(f"{name}: changes by hand must be numbers.")
+            continue
+        if not ADJUST_DB[0] <= gain <= ADJUST_DB[1]:
+            errors.append(f"{name}: a level change must be between {ADJUST_DB[0]:+g} and {ADJUST_DB[1]:+g} dB.")
+        if not -ADJUST_MS <= delay <= ADJUST_MS:
+            errors.append(f"{name}: a delay change must be between -{ADJUST_MS:g} and +{ADJUST_MS:g} ms.")
+    return errors
 
 
 def save(cfg):

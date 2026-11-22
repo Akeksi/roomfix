@@ -11,7 +11,13 @@ with the speakers. It may sit on another output device with another latency.
 
 `render` runs a signal through exactly this chain, `export` writes it out for
 CamillaDSP or Equalizer APO.
+
+Changes by hand (cfg["adjust"]: level, delay and polarity of a speaker, of one of its
+drivers, or of the subwoofer) come on top of the measured values. The EQ is fitted
+without them, so that it does not undo them, and the predicted response includes them.
 """
+import copy
+
 import numpy as np
 from scipy import signal
 from scipy.optimize import least_squares
@@ -172,6 +178,31 @@ def _smooth_db(f, power, octaves):
 FINE = np.interp(np.log(GRID), np.log([100.0, 1000.0]), [1 / 12, 1 / 3])  # smoothing width, octaves
 
 
+# ---- changes by hand -------------------------------------------------------
+def _change(item):
+    """(dB, ms, invert) of one entry of cfg["adjust"]."""
+    item = item if isinstance(item, dict) else {}
+    return float(item.get("gain") or 0.0), float(item.get("delay_ms") or 0.0), bool(item.get("invert"))
+
+
+def changes(cfg, n_speakers, n_ways):
+    """The changes by hand as (per speaker: (dB, ms, invert), per speaker and way: ..., sub)."""
+    adj = cfg.get("adjust") or {}
+    spk = list(adj.get("speakers") or [])
+    spk = [spk[si] if si < len(spk) and isinstance(spk[si], dict) else {} for si in range(n_speakers)]
+    ways = [[_change((s.get("ways") or [])[wi] if wi < len(s.get("ways") or []) else None) for wi in range(n_ways)]
+            for s in spk]
+    return [_change(s) for s in spk], ways, _change(adj.get("sub"))
+
+
+def count_changes(cfg):
+    """How many values are changed by hand."""
+    adj = cfg.get("adjust") or {}
+    items = [adj.get("sub")] + [s for s in adj.get("speakers") or []]
+    items += [w for s in adj.get("speakers") or [] if isinstance(s, dict) for w in s.get("ways") or []]
+    return sum(1 for item in items for v in _change(item) if v)
+
+
 # ---- main ----------------------------------------------------------------
 def design(cfg, meas, cal=None, verify_irs=None):
     fs, ways, n_ways = meas["fs"], cfg["ways"], len(cfg["ways"])
@@ -180,6 +211,10 @@ def design(cfg, meas, cal=None, verify_irs=None):
     mic = dsp.calibration_gain(cal, f)
     tgt = cfg["target"]
     shape = target_curve(GRID, tgt)
+    spk_adj, way_adj, sub_adj = changes(cfg, len(cfg["speakers"]), n_ways)
+
+    def ms(value):
+        return int(round(value * fs / 1000))
 
     def raw(key, wi, ir):
         p = protect_response(cfg, wi, f)
@@ -243,9 +278,19 @@ def design(cfg, meas, cal=None, verify_irs=None):
             corr = np.exp(2j * np.pi * np.outer(lags, f[band]) / fs) @ (first[band] * np.conj(total[0][band]))
             if corr[np.argmax(np.abs(corr))].real < 0:
                 inverts = [not x for x in inverts]
+                total = [-t for t in total]  # what plays once corrected: for the sum with the subwoofer
                 notes.append(f"{spk['name']} is connected with reversed polarity; this is corrected digitally.")
+        # the same with the changes by hand, for the predicted response
+        sa, wa = spk_adj[si], way_adj[si]
+        total_m, fine_m = total, fine
+        if sa[2] or any(g or d or i for g, d, i in wa):
+            chain_m = [xo[wi] * 10 ** ((gains[wi] + wa[wi][0]) / 20) * (-1 if inverts[wi] ^ wa[wi][2] ^ sa[2] else 1)
+                       * np.exp(-2j * np.pi * f * (delays[wi] + ms(wa[wi][1])) / fs) for wi in range(n_ways)]
+            total_m = [sum(resp[wi][p] * chain_m[wi] for wi in range(n_ways)) for p in range(n_pos)]
+            fine_m = _smooth_db(f, np.mean([np.abs(t) ** 2 for t in total_m], axis=0), FINE)
         work.append(dict(fine=fine, coarse=coarse, f_lo=float(f_lo), f_hi=float(f_hi), offset=offset,
-                         arrival=arrival, drv_db=drv_db, xo=xo, gains=gains, total=total))
+                         arrival=arrival, drv_db=drv_db, xo=xo, gains=gains, total=total,
+                         total_m=total_m, fine_m=fine_m))
         speakers.append({
             "name": spk["name"], "input": spk["input"], "eq": [], "gain": 0.0,
             "ways": [{"name": ways[wi]["name"], "channel": spk["channels"][wi],
@@ -310,12 +355,21 @@ def design(cfg, meas, cal=None, verify_irs=None):
                                  "a higher subwoofer test level.")
         if sub["delay"] > 0.25 * fs or wait > 0.25 * fs:
             notes.append("The delay between the output devices is unusually long; sound will lag behind video.")
-        for spk, w, gain in zip(speakers, work, sub["gains"]):
+        for si, (spk, w, gain) in enumerate(zip(speakers, work, sub["gains"])):
             rel = sub["delay"] - spk["delay"] - wait
             term = [h * h_lp * 10 ** (gain / 20) * (-1 if flip else 1) * np.exp(-2j * np.pi * f * rel / fs) for h in hs]
             power = np.mean([np.abs(t + b) ** 2 for t, b in zip(w["total"], term)], axis=0)
             w["bass"] = {"speaker": w["fine"], "sub": _smooth_db(f, np.mean([np.abs(b) ** 2 for b in term], axis=0), FINE)}
             w["fine"], w["coarse"] = _smooth_db(f, power, FINE), _smooth_db(f, power, 1 / 2)
+            # with the changes by hand. (A speaker's own level also sets what it sends to the
+            # subwoofer; its polarity and delay do not.)
+            rel_m = rel + ms(sub_adj[1]) - ms(spk_adj[si][1])
+            term_m = [h * h_lp * 10 ** ((gain + sub_adj[0]) / 20) * (-1 if flip ^ sub_adj[2] else 1)
+                      * np.exp(-2j * np.pi * f * rel_m / fs) for h in hs]
+            power_m = np.mean([np.abs(t + b) ** 2 for t, b in zip(w["total_m"], term_m)], axis=0)
+            w["bass_m"] = {"speaker": w["fine_m"],
+                           "sub": _smooth_db(f, np.mean([np.abs(b) ** 2 for b in term_m], axis=0), FINE)}
+            w["fine_m"] = _smooth_db(f, power_m, FINE)
             third, wide = _smooth_db(f, power, 1 / 3), _smooth_db(f, power, 1.0)
             ok = np.where(wide > np.median(third[(GRID >= 200) & (GRID <= 5000)]) - 6)[0]
             w["f_lo"] = float(tgt["f_min"] or max(GRID[ok[0]], floor))
@@ -346,12 +400,16 @@ def design(cfg, meas, cal=None, verify_irs=None):
             notes.append(f"The subwoofer needs a high digital level, which costs {summed - headroom:.0f} dB of "
                          "overall volume. Turn up the subwoofer's own volume and measure again.")
         headroom = max(headroom, summed)
+    # a level raised by hand: everything else plays that much quieter, so nothing clips
+    raised = [sa[0] + wa[0] for sa, ws in zip(spk_adj, way_adj) for wa in ws]
+    raised += [sa[0] + sub_adj[0] for sa in spk_adj] if sub else []
+    shift = round(max(max(raised, default=0.0), 0.0), 1)
     for si, (spk, w) in enumerate(zip(speakers, work)):
         spk["gain"] = round(w["trim"] - headroom, 1)
         c = {
             "name": spk["name"],
             "measured": w["fine"] - common,
-            "predicted": w["fine"] + w["eq_db"] + w["trim"] - common,
+            "predicted": w["fine_m"] + w["eq_db"] + w["trim"] + spk_adj[si][0] - common,
             "range": [round(w["f_lo"]), round(w["f_hi"])],
             "drivers": [],
         }
@@ -360,12 +418,13 @@ def design(cfg, meas, cal=None, verify_irs=None):
                 low = (ways[wi].get("min_freq") or 0) / 2.5 if wi else 0
                 rawc = np.where(GRID >= low, w["drv_db"][wi] - common, np.nan)
                 c["drivers"].append({"name": way["name"], "raw": rawc,
-                                     "filtered": rawc + dsp.db(dsp.response(way["filters"], fs, GRID)) + way["gain"]})
+                                     "filtered": rawc + dsp.db(dsp.response(way["filters"], fs, GRID)) + way["gain"]
+                                     + way_adj[si][wi][0]})
         if sub:
-            c["bass"] = {k: v - common for k, v in w["bass"].items()}
+            c["bass"] = {k: v - common for k, v in w.get("bass_m", w["bass"]).items()}
         if verify_irs is not None and si < len(verify_irs):
             h = np.fft.rfft(verify_irs[si], NFFT) / mic
-            c["verified"] = _smooth_db(f, np.abs(h) ** 2, FINE) - common + headroom
+            c["verified"] = _smooth_db(f, np.abs(h) ** 2, FINE) - common + headroom + shift
             win = np.clip(np.minimum(np.log2(f / 350) / 0.5, np.log2(11000 / f) / 0.5), 0, 1)
             c["verified_arrival_ms"] = round((dsp.envelope_peak(np.fft.irfft(h * win, NFFT)) / fs - PRE) * 1000, 3)
             if sub and sub["device"]:
@@ -382,8 +441,30 @@ def design(cfg, meas, cal=None, verify_irs=None):
                                  "was different when the result was measured than when the delay was measured. "
                                  "Press \"Measure result again\"; if it stays, measure again.")
         curves.append(c)
+
+    auto = copy.deepcopy({"speakers": speakers, "sub": sub})  # as measured, before the changes by hand
+    for spk, sa, ws in zip(speakers, spk_adj, way_adj):
+        spk["gain"] = round(spk["gain"] + sa[0] - shift, 1)
+        for way, wa in zip(spk["ways"], ws):
+            way["gain"] = round(way["gain"] + wa[0], 1)
+            way["invert"] = bool(way["invert"] ^ wa[2] ^ sa[2])
+            way["delay"] += ms(sa[1]) + ms(wa[1])
+    if sub:
+        sub["gains"] = [round(g + sub_adj[0], 1) for g in sub["gains"]]
+        sub["invert"] = bool(sub["invert"] ^ sub_adj[2])
+        sub["delay"] += ms(sub_adj[1])
+    early = min([way["delay"] for spk in speakers for way in spk["ways"]] + ([sub["delay"]] if sub else []))
+    if early < 0:  # nothing can play before its sound arrives: the others wait instead
+        for way in (way for spk in speakers for way in spk["ways"]):
+            way["delay"] -= early
+        if sub:
+            sub["delay"] -= early
+    if shift:
+        notes.append(f"A level is raised by hand, so everything plays {shift:.1f} dB quieter: loud passages "
+                     "must not clip. Turn the volume up by as much.")
     return {"fs": fs, "speakers": speakers, "sub": sub, "curves": curves, "freq": GRID, "target": shape,
-            "headroom": round(headroom, 1), "warnings": meas.get("warnings", []) + notes}
+            "headroom": round(headroom, 1), "warnings": meas.get("warnings", []) + notes,
+            "auto": auto, "shift": shift, "changes": count_changes(cfg)}
 
 
 def to_json(obj):

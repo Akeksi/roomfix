@@ -6,7 +6,7 @@ const el = (tag, attrs = {}, ...kids) => {
   e.append(...kids);
   return e;
 };
-let S, cfg, D, version = -1, saveTimer, dragging = false, volTimer;
+let S, cfg, D, version = -1, saveTimer, dragging = false, volTimer, settingsVersion, savedKey;
 
 async function post(path, body = {}) {
   const r = await fetch(path, { method: "POST", headers: { "X-Roomfix": "1" }, body: JSON.stringify(body) });
@@ -340,6 +340,107 @@ function renderResult() {
         el("td", { className: "num", textContent: f.gain.toFixed(1) + " dB" }), el("td", { className: "num", textContent: f.q })))))));
   $("#summary").replaceChildren(el("div", { className: "scroll" },
     el("table", {}, el("tr", {}, ...head.map((h) => el("th", { textContent: h }))), ...rows)), ...eq);
+  renderAdjust(true);
+}
+
+// ---------- changes by hand ----------
+// cfg.adjust: {speakers: [{gain, delay_ms, invert, ways: [{gain, delay_ms, invert}]}], sub: {...}}
+function change(si, wi) {  // the entry of a speaker (wi undefined), one of its drivers, or the sub (si null)
+  cfg.adjust = cfg.adjust || { speakers: [], sub: {} };
+  const a = cfg.adjust;
+  if (si === null) return (a.sub = a.sub || {});
+  a.speakers = a.speakers || [];
+  while (a.speakers.length <= si) a.speakers.push({});
+  const spk = (a.speakers[si] = a.speakers[si] || {});
+  if (wi === undefined) return spk;
+  spk.ways = spk.ways || [];
+  while (spk.ways.length <= wi) spk.ways.push({});
+  return (spk.ways[wi] = spk.ways[wi] || {});
+}
+
+const changed = (c) => !!(c.gain || c.delay_ms || c.invert);
+
+function renderAdjust(force) {
+  const box = $("#adjust");
+  if (!D || !D.auto) return box.replaceChildren();
+  if (!force && document.activeElement.matches("#adjust input[type=number]")) return;  // (not while typing in it)
+  const A = D.auto, ms = (n) => ((n / D.fs) * 1000).toFixed(2) + " ms";
+  const multi = A.speakers[0].ways.length > 1;
+  const row = (title, c, measured, indent) => {
+    const number = (key, step, min, max) => {
+      const input = el("input", { type: "number", step, min, max, value: c[key] || 0, className: c[key] ? "changed" : "",
+        onchange: () => { c[key] = Math.max(min, Math.min(max, +input.value || 0)); input.value = c[key]; changedAdjust(); } });
+      input.setAttribute("aria-label", `${title}: ${key === "gain" ? "level" : "delay"} change`);
+      return input;
+    };
+    const flip = el("input", { type: "checkbox", checked: !!c.invert, onchange: () => { c.invert = flip.checked; changedAdjust(); } });
+    flip.setAttribute("aria-label", `${title}: polarity flipped`);
+    const reset = el("button", { type: "button", textContent: "Reset", disabled: !changed(c),
+      onclick: () => { delete c.gain; delete c.delay_ms; delete c.invert; changedAdjust(true); } });
+    return el("tr", { className: changed(c) ? "changed" : "" },
+      el("td", { className: indent ? "sub" : "", textContent: title }),
+      el("td", {}, number("gain", 0.5, -20, 10)), el("td", {}, number("delay_ms", 0.05, -20, 20)),
+      el("td", {}, el("label", { className: "check" }, flip, "flip")),
+      el("td", { className: "muted num", textContent: measured }), el("td", {}, reset));
+  };
+  const rows = [];
+  A.speakers.forEach((spk, si) => {
+    const w0 = spk.ways[0];
+    rows.push(row(multi ? `${spk.name}, whole speaker` : spk.name, change(si),
+      multi ? `${spk.gain.toFixed(1)} dB before the drivers`
+        : `${(spk.gain + w0.gain).toFixed(1)} dB · ${ms(w0.delay)} · ${w0.invert ? "inverted" : "normal"}`));
+    if (multi) spk.ways.forEach((w, wi) => rows.push(row(`${spk.name} ${w.name.toLowerCase()}`, change(si, wi),
+      `${(spk.gain + w.gain).toFixed(1)} dB · ${ms(w.delay)} · ${w.invert ? "inverted" : "normal"}`, true)));
+  });
+  if (A.sub) rows.push(row(A.sub.name, change(null),
+    `${A.sub.gains.map((g, i) => (A.speakers[i].gain + g).toFixed(1)).join(" / ")} dB · ${ms(A.sub.delay)} · ${A.sub.invert ? "inverted" : "normal"}`));
+  box.replaceChildren(el("tr", {}, ...["", "Level (dB)", "Delay (ms)", "Polarity", "Measured", ""].map((h) => el("th", { textContent: h }))), ...rows);
+  $("#adjust-reset").disabled = !rows.some((r) => r.classList.contains("changed"));
+}
+
+function changedAdjust(rerender) {
+  save();
+  if (rerender) renderAdjust(true);
+  else for (const tr of $("#adjust").querySelectorAll("tr")) {  // mark without losing the focus
+    const inputs = tr.querySelectorAll("input[type=number]");
+    for (const input of inputs) input.classList.toggle("changed", +input.value !== 0);
+    const on = [...inputs].some((i) => +i.value !== 0) || !!tr.querySelector("input[type=checkbox]:checked");
+    if (inputs.length) {
+      tr.classList.toggle("changed", on);
+      tr.querySelector("button").disabled = !on;
+    }
+  }
+}
+
+// ---------- saved corrections ----------
+function renderSaved() {
+  const list = S.corrections || [];
+  $("#saved").hidden = !list.length;
+  $("#correction-note").hidden = !S.correction_note;
+  $("#correction-note").textContent = S.correction_note || "";
+  const key = JSON.stringify(list);
+  const typing = document.activeElement.matches("#saved-list input");  // (not while a name is typed)
+  if (key === savedKey || typing) return;
+  savedKey = key;
+  const when = (t) => new Date(t * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  $("#saved-list").replaceChildren(el("tr", {}, ...["", "Name", "Applied", "What shapes it", ""].map((h) => el("th", { textContent: h }))),
+    ...list.map((c) => {
+      const name = el("input", { value: c.name, placeholder: "No name: history", maxLength: 60,
+        onchange: act("/api/correction/rename", () => ({ id: c.id, name: name.value }), "#saved-msg"),
+        onkeydown: (e) => { if (e.key === "Enter") name.blur(); } });
+      name.setAttribute("aria-label", "Name of the correction applied " + when(c.created));
+      const use = c.active ? el("span", { className: "chip on", textContent: "In use" })
+        : el("button", { type: "button", textContent: "Use", disabled: S.job.running,
+          onclick: act("/api/correction/use", () => ({ id: c.id }), "#saved-msg") });
+      const del = el("button", { type: "button", textContent: "Delete", disabled: c.active,
+        title: c.active ? "In use: use another one first" : "",
+        onclick: () => confirm(`Delete the correction ${c.name ? `"${c.name}"` : "applied " + when(c.created)}? This cannot be undone.`)
+          && act("/api/correction/delete", () => ({ id: c.id }), "#saved-msg")() });
+      return el("tr", { className: c.active ? "active" : "" }, el("td", {}, use), el("td", {}, name),
+        el("td", { className: "muted", textContent: when(c.created) }),
+        el("td", { className: "muted", textContent: c.summary + (c.editable ? "" : " (plays as saved; cannot be changed here)") }),
+        el("td", {}, del));
+    }));
 }
 
 // ---------- status ----------
@@ -397,6 +498,16 @@ function update(state) {
   $("#job-result").hidden = !done;
   $("#job-result").textContent = job.error || job.result || "";
   $("#job-result").className = "result" + (job.error ? " bad" : "");
+  // the settings changed on the PC's side: another saved correction is in use (switched from
+  // the phone or the tray icon), or a new measurement started without the changes by hand
+  if (settingsVersion !== undefined && S.settings_version !== settingsVersion) {
+    clearTimeout(saveTimer);
+    cfg = structuredClone(S.cfg);
+    renderSetup(); renderTarget(); renderAdjust(true);
+  }
+  settingsVersion = S.settings_version;
+  $("#unapplied").hidden = !S.unapplied || busy;
+  renderSaved();
   if (S.design_version !== version) {
     version = S.design_version;
     fetch("/api/design").then((r) => r.json()).then((d) => { D = d; renderResult(); });
@@ -404,7 +515,12 @@ function update(state) {
 }
 
 async function poll() {
-  try { update(await (await fetch("/api/state")).json()); } catch (e) { /* server stopped */ }
+  try {
+    update(await (await fetch("/api/state")).json());
+    $("#closed").hidden = true;
+  } catch (e) {
+    $("#closed").hidden = false;  // the server has stopped (closed from the tray icon, or idle)
+  }
   setTimeout(poll, S && S.job.running ? 400 : 2500);
 }
 
@@ -430,6 +546,7 @@ function act(path, body, msgEl) {
   $("#bypass").onclick = act("/api/bypass", null, "#apply-msg");
   $("#mute").onclick = act("/api/mute", () => ({ mute: !S.playback.mute }));
   $("#source").onchange = act("/api/source", () => ({ name: $("#source").value }));
+  $("#adjust-reset").onclick = () => { cfg.adjust = { speakers: [], sub: {} }; changedAdjust(true); };
   const vol = $("#volume"), send = () => post("/api/volume", { value: Number(vol.value) }).catch(() => {});
   vol.oninput = () => {  // while dragging: show at once, send at most every 80 ms
     dragging = true;

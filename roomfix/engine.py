@@ -118,6 +118,8 @@ def tv_app_config(cfg, design, channels=None):
     the subwoofer up with the PC's path to the TV. The TV's speakers do not wait for this
     engine, so the subwoofer is as early as it can be, plus the delay set by ear.
     """
+    # as measured: the changes by hand are for the PC's path, this source has its own by ear
+    design = dict(design, **(design.get("auto") or {}))
     t, sub = config.tv_app(cfg), design.get("sub")
     if not t or not sub:
         return None
@@ -343,7 +345,12 @@ def correction_start():
     from . import supervisor
     _check(_yamls() + _tv_app_files())
     supervisor.switch_on()
-    status = supervisor.start()
+    return _started(supervisor.start())
+
+
+def _started(status):
+    """A message about the correction, from the status of the supervisor that runs it."""
+    from . import supervisor
     if status is None:
         raise RuntimeError("The playback engine could not be started. See engine.log in " + str(config.data_dir()))
     tv = status.get("source") == "tv_app"
@@ -456,35 +463,77 @@ class session:
 
 
 # ---- public --------------------------------------------------------------
-def apply(cfg, design, channels=None):
-    """Write the correction and switch it on. Returns a message for the user."""
+def engine_files(cfg, design, channels=None):
+    """{path: text} of the applied correction's engine files for this design."""
     if cfg["backend"] == "equalizerapo":
-        text = eqapo_config(design)
-        (config.data_dir() / "equalizerapo.txt").write_text(text, encoding="utf-8")
-        if not WINDOWS:
-            return f"Demo: Equalizer APO config written to {config.data_dir() / 'equalizerapo.txt'}"
-        _eqapo_write(text)
-        return "Correction is active (Equalizer APO)."
-    for old in _yamls() + _tv_app_files():
-        old.unlink()
+        return {config.data_dir() / "equalizerapo.txt": eqapo_config(design)}
+    files = {}
     for i, (_, conf) in enumerate(camilladsp_configs(cfg, design, channels)):
         path = _yaml() if i == 0 else _yaml().with_name(f"camilladsp_{i + 1}.yml")
-        path.write_text(yaml.safe_dump(conf, sort_keys=False), encoding="utf-8")
+        files[path] = yaml.safe_dump(conf, sort_keys=False)
     tv = tv_app_config(cfg, design, channels)
     if tv:
-        _tv_app_yaml().write_text(yaml.safe_dump(tv[1], sort_keys=False), encoding="utf-8")
+        files[_tv_app_yaml()] = yaml.safe_dump(tv[1], sort_keys=False)
+    return files
+
+
+def _put(files):
+    """Put new engine files in place of the applied ones. CamillaDSP checks them first: if it
+    refuses one, the applied correction stays as it is."""
+    staged = {path: path.with_name(path.name + ".new") for path in files}
+    try:
+        for path, text in files.items():
+            staged[path].write_text(text, encoding="utf-8")
+        if WINDOWS and any(path.suffix == ".yml" for path in files):
+            _download()
+            _check([tmp for path, tmp in staged.items() if path.suffix == ".yml"])
+    except Exception:
+        for tmp in staged.values():
+            tmp.unlink(missing_ok=True)
+        raise
+    if any(path.suffix == ".yml" for path in files):
+        for old in _yamls() + _tv_app_files():
+            if old not in files:
+                old.unlink()
+    for path, tmp in staged.items():
+        config.replace_file(tmp, path)
+
+
+def apply(cfg, design, channels=None, written=None):
+    """Write the correction and switch it on. written(paths) is called once the new engine
+    files are in place (to save the correction). Returns a message for the user.
+
+    A running supervisor reloads its engines, which takes effect without a pause while the
+    output devices stay the same; otherwise it is started."""
+    if cfg["backend"] == "camilladsp" and WINDOWS and not cfg["capture_device"]:
+        raise RuntimeError("Select the system audio source in Setup first.")
+    files = engine_files(cfg, design, channels)
+    _put(files)
+    if written:
+        written(list(files))
+    return switch_to_files(cfg)
+
+
+def switch_to_files(cfg):
+    """Make the engine files in place the ones that play. Returns a message for the user."""
+    if cfg["backend"] == "equalizerapo":
+        path = config.data_dir() / "equalizerapo.txt"
+        if not WINDOWS:
+            return f"Demo: Equalizer APO config written to {path}"
+        _eqapo_write(path.read_text(encoding="utf-8"))
+        return "Correction is active (Equalizer APO)."
     if not WINDOWS:
         return f"Demo: CamillaDSP config written to {_yaml()}"
-    if not cfg["capture_device"]:
-        raise RuntimeError("Select the system audio source in Setup first.")
-    _download()
-    camilla_stop()
+    from . import supervisor
     if cfg["autostart"]:
-        from . import supervisor
         line = " ".join(f'""{arg}""' for arg in supervisor.command())
         _startup_file().write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
     elif _startup_file().exists():
         _startup_file().unlink()
+    status = supervisor.reload()
+    if status is not None:
+        return _started(status)
+    camilla_stop()  # (also engines left over from a measurement that was cut short)
     return correction_start()
 
 

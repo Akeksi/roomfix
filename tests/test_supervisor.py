@@ -38,6 +38,7 @@ class World:
         self.state = "Running"
         self.peak = -20.0  # dBFS of what arrives at the engines' inputs
         self.clashes = []  # an engine started on a device that another running engine holds
+        self.reloaded, self.reload_ok = [], True  # engines told to read their configuration again
 
     def spawn(self, path, port, volume, mute):
         proc = Proc()
@@ -54,6 +55,9 @@ class World:
             return None
         if command == "Exit":
             proc.code = 0
+        if command == "Reload":
+            self.reloaded.append(port)
+            return {"result": "Ok"} if self.reload_ok else {"result": {"ConfigValidationError": "no"}}
         if isinstance(command, dict):
             if "GetCaptureSignalPeakSince" in command:
                 return {"result": "Ok", "value": [self.peak, self.peak]}
@@ -632,3 +636,199 @@ def test_real_engine_is_restarted_and_obeys_the_volume(tmp_path, monkeypatch):
     finally:
         sup.stop()
     assert sup.engines[0].proc is None
+
+
+# ---- saved corrections: switching without stopping ---------------------------
+def other_processing(files, gain=-3.0):
+    """The same output devices, other filters: as a different correction would be."""
+    for path in files:
+        conf = yaml.safe_load(path.read_text())
+        conf["filters"] = {"g": {"type": "Gain", "parameters": {"gain": gain}}}
+        path.write_text(yaml.safe_dump(conf))
+
+
+def test_new_configuration_is_taken_up_without_stopping(tmp_path, monkeypatch):
+    world, sup = setup(tmp_path, monkeypatch)
+    sup.set_volume(value=-30)
+    world.run(sup, 3)
+    procs = [e.proc for e in sup.engines]
+    other_processing(sup.files)
+    del world.sent[:]
+    sup.reload()
+    assert sorted(world.reloaded) == sorted(e.port for e in sup.engines)
+    world.run(sup, 3)
+    assert [e.proc for e in sup.engines] == procs and len(world.spawned) == 2  # nothing stopped or started
+    assert {(port, json.dumps(cmd)) for port, cmd in world.sent} >= {(e.port, '{"SetVolume": -30.0}') for e in sup.engines}
+    # a saved correction names a device as it was called then: today's name goes in first
+    world.outputs[0] = "2 - LG TV (HDMI)"
+    sup.reload()
+    assert yaml.safe_load(sup.files[0].read_text())["devices"]["playback"]["device"] == "2 - LG TV (HDMI)"
+    assert len(world.reloaded) == 4 and len(world.spawned) == 2
+    # an engine that refuses the new file is started again, with it
+    world.reload_ok = False
+    sup.reload()
+    world.run(sup, 3)
+    assert len(world.spawned) == 4 and statuses(sup) == ["running", "running"]
+
+
+def test_other_output_devices_start_the_engines_anew(tmp_path, monkeypatch):
+    world, sup = setup(tmp_path, monkeypatch)
+    world.run(sup, 3)
+    (tmp_path / "camilladsp_2.yml").unlink()  # say the subwoofer is now on the DAC's own channel
+    sup.reload()
+    world.run(sup, 3)
+    assert world.running() == ["LG TV (HDMI)"] and len(sup.engines) == 1 and not world.clashes
+    with pytest.raises(ValueError):
+        sup.reload(files=[])  # nothing applied: nothing to reload
+
+
+def test_saved_correction_is_switched_from_the_phone(tmp_path, monkeypatch):
+    from roomfix import corrections
+    world, sup, thread, call = _serve(tmp_path, monkeypatch)
+    told = []
+    sup.listeners.append(lambda: told.append(sup.status()["correction"]))
+    try:
+        earlier = corrections.presets()[0]["id"]  # what was applied: kept the first time
+        other_processing(sup.files)
+        movie = corrections.record(corrections.live_files(), name="Movie")
+        corrections.use(earlier)
+        code, _, status = call("/api/status")
+        assert [(c["name"], c["active"]) for c in status["corrections"]] == [("Movie", False),
+                                                                              ("Earlier correction", True)]
+        for _ in range(2):  # sent again when the reply was lost: the same
+            code, _, status = call("/api/correction", {"id": movie})
+            assert code == 200 and status["correction"] == movie
+            assert [c["active"] for c in status["corrections"]] == [True, False]
+        assert "filters" in yaml.safe_load((tmp_path / "camilladsp.yml").read_text())
+        assert len(world.reloaded) == 4 and len(world.spawned) == 2  # (no engine stopped)
+        assert told == [movie, movie] and sup.switched[0] == movie  # the tray says which
+        for bad in ({"id": "../settings"}, {"id": 5}, {}):
+            assert call("/api/correction", bad)[0] == 400
+        assert call("/api/correction", {"id": earlier}, host="evil.example")[0] == 403
+        assert call("/api/status")[2]["correction"] == movie
+    finally:
+        supervisor.stop()
+        thread.join(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the notification area is a Windows thing")
+def test_tray_menu_switches_the_saved_correction(tmp_path, monkeypatch):
+    from roomfix import corrections, tray
+    world, sup = setup(tmp_path, monkeypatch)
+    sup.set_keys(False)  # leave the volume keys of this computer alone
+    corrections.ensure()
+    earlier = corrections.active()
+    other_processing(sup.files)
+    corrections.record(corrections.live_files())  # in use, without a name
+    icon = tray.Tray(sup)
+    icon.start()
+    try:
+        assert icon.ready.wait(10) and icon.hwnd
+        shown = {}
+        icon.u.AppendMenuW = lambda menu, flags, ident, text: shown.update({text: (ident, flags)}) or 1
+        icon.u.TrackPopupMenu = lambda *args: shown["Earlier correction"][0]  # the user picks the preset
+        icon._menu()
+        assert "Unnamed (in use)" in shown and shown["Unnamed (in use)"][1] & tray.MF_CHECKED
+        assert sup.status()["correction"] == earlier and icon.osd_text == "Correction: Earlier correction"
+        corrections.rename(earlier, "")  # no presets left: no menu for them
+        shown.clear()
+        icon.u.TrackPopupMenu = lambda *args: 0
+        icon._menu()
+        assert "Saved corrections" not in shown
+    finally:
+        icon.close()
+
+
+def test_apply_reloads_running_engines_and_keeps_the_old_files_when_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "WINDOWS", True)
+    monkeypatch.setattr(engine, "_download", lambda: None)
+    monkeypatch.setattr(engine, "_startup_file", lambda: tmp_path / "roomfix.vbs")
+    monkeypatch.setattr(engine, "camilla_stop", lambda: pytest.fail("the engines were stopped"))
+    running = {"enabled": True, "source": "pc", "engines": [{"device": "DAC", "status": "running", "detail": ""}]}
+    monkeypatch.setattr(supervisor, "reload", lambda: running)
+    checked = []
+    monkeypatch.setattr(engine, "_check", lambda files: checked.extend(p.name for p in files))
+    cfg = dict(engine.config.DEFAULT, capture_device="CABLE Output", output_device="DAC")
+    files = {tmp_path / "camilladsp.yml": "new: 1\n"}
+    monkeypatch.setattr(engine, "engine_files", lambda *args: files)
+    (tmp_path / "camilladsp.yml").write_text("old: 1\n")
+    (tmp_path / "camilladsp_2.yml").write_text("old: 2\n")
+    written = []
+    assert engine.apply(cfg, None, written=written.extend) == "Correction is active (CamillaDSP)."
+    assert checked == ["camilladsp.yml.new"]  # checked before it replaced anything
+    assert written == list(files) and sorted(p.name for p in engine._yamls()) == ["camilladsp.yml"]
+    assert (tmp_path / "camilladsp.yml").read_text() == "new: 1\n" and (tmp_path / "roomfix.vbs").exists()
+
+    def refuse(paths):
+        raise RuntimeError("CamillaDSP rejected the configuration")
+    monkeypatch.setattr(engine, "_check", refuse)
+    files = {tmp_path / "camilladsp.yml": "broken\n", tmp_path / "camilladsp_2.yml": "broken\n"}
+    with pytest.raises(RuntimeError, match="rejected"):
+        engine.apply(cfg, None)
+    assert (tmp_path / "camilladsp.yml").read_text() == "new: 1\n"  # what plays is left alone
+    assert sorted(p.name for p in tmp_path.iterdir() if ".new" in p.name) == []
+
+
+def test_page_from_the_tray_has_no_window_and_closes_when_idle():
+    from roomfix import __main__
+    exe, *args = supervisor.command(page=True)
+    assert args[-1] == "--from-tray"
+    if os.name == "nt":
+        assert os.path.basename(exe).lower() == "pythonw.exe"  # no console window
+
+    class App:
+        job, seen = {"running": True}, time.monotonic() - 3600
+
+    class Server:
+        closed = False
+
+        def shutdown(self):
+            Server.closed = True
+
+    app = App()
+    done = threading.Thread(target=__main__._close_when_idle, args=(Server(), app, 0.2, 0.05), daemon=True)
+    done.start()
+    time.sleep(0.3)
+    assert not Server.closed  # a measurement runs
+    app.job = {"running": False}
+    app.seen = time.monotonic()
+    time.sleep(0.1)
+    assert not Server.closed  # the page asked a moment ago
+    done.join(2)
+    assert Server.closed
+
+
+def test_real_engine_takes_up_a_new_configuration_without_stopping(tmp_path, monkeypatch):
+    exe = os.environ.get("CAMILLADSP") or shutil.which("camilladsp")
+    if not exe:
+        pytest.skip("camilladsp binary not available")
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "_exe", lambda: exe)
+    path = tmp_path / "camilladsp.yml"
+    path.write_text(yaml.safe_dump({"devices": {
+        "samplerate": 48000, "chunksize": 1024,
+        "capture": {"type": "SignalGenerator", "channels": 2, "signal": {"type": "Sine", "freq": 1000, "level": -40}},
+        "playback": {"type": "File", "channels": 2, "format": "S16_LE", "filename": os.devnull}}}))
+    sup = supervisor.Supervisor([path])
+    sup.set_volume(value=-27)
+    try:
+        port = sup.engines[0].port
+        for _ in range(100):
+            sup.check()
+            if engine._request(port, "GetVolume"):
+                break
+            time.sleep(0.2)
+        first = sup.engines[0].proc
+        other_processing([path], gain=-7.5)
+        sup.reload(files=[path])
+        config = yaml.safe_load(engine._ws(port, "GetConfig"))
+        assert config["filters"]["g"]["parameters"]["gain"] == -7.5
+        assert sup.engines[0].proc is first and first.poll() is None  # the same process, still running
+        assert engine._ws(port, "GetVolume") == -27
+        # a file CamillaDSP refuses: the engine keeps what it had until it is started again
+        path.write_text("devices: nonsense\n")
+        sup.reload(files=[path])
+        assert sup.engines[0].proc is None
+    finally:
+        sup.stop()

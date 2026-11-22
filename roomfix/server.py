@@ -1,16 +1,20 @@
 """Local web UI: a small JSON API plus static files, bound to 127.0.0.1 only."""
+import copy
 import json
+import shutil
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
 
-from . import audio, config, design, dsp, engine, measure, sim
+from . import audio, config, corrections, design, dsp, engine, measure, sim
 
 WEB = Path(__file__).parent / "web"
 TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}
+TARGETS = {(0.0, 0.0): "Flat", (-0.5, 0.0): "Slight downward tilt", (-0.8, 3.0): "Balanced", (-1.0, 6.0): "Warm"}
 
 
 class App:
@@ -21,7 +25,7 @@ class App:
         self.cfg = config.demo() if demo else config.load()
         if not demo and not self.cfg["capture_device"]:  # first run: find the virtual cable
             self.cfg["capture_device"] = config.guess_capture(self.devices()["inputs"])
-        self.meas = self.verify_irs = self.design = None
+        self.meas = self.verify_irs = self.design = self.meas_id = None
         self.design_version = 0
         self.job = {"running": False, "action": "", "progress": 0, "message": "", "active": None,
                     "prompt": None, "error": None, "result": None}
@@ -29,8 +33,13 @@ class App:
         self._answer_ok = False
         self._cancel = False
         self._span = (0, 1)
-        self.lock = threading.Lock()
-        self._load_measurement()
+        self.lock = threading.RLock()
+        self.seen = time.monotonic()  # when the page last asked something
+        self.settings_version = 0  # changes when the settings change here, not on the page
+        self.note = ""  # about the saved correction in use, when the page cannot show it
+        corrections.ensure()
+        if not demo:
+            self._load_measurement()
 
     # ---- helpers ---------------------------------------------------------
     def devices(self):
@@ -70,12 +79,15 @@ class App:
     def _save_measurement(self):
         arrays = {k: np.array(v) for k, v in self.meas["irs"].items()}
         meta = {k: v for k, v in self.meas.items() if k != "irs"}
-        np.savez_compressed(config.data_dir() / "measurement.npz", meta=json.dumps(meta), **arrays)
+        path = config.data_dir() / "measurement.npz"
+        np.savez_compressed(path, meta=json.dumps(meta), **arrays)
+        self.meas_id = corrections.measurement_id(path)
 
     def _load_measurement(self):
         path = config.data_dir() / "measurement.npz"
-        if self.demo or not path.exists():
+        if not path.exists():
             return
+        self.meas_id = corrections.measurement_id(path)
         try:
             data = np.load(path)
             meas = json.loads(str(data["meta"]))
@@ -96,24 +108,122 @@ class App:
         self.design_version += 1
 
     def state(self):
+        self._follow()
+        layout = self.layout()
+        saved = [dict(e, editable=e["editable"] and e.pop("layout") == layout) for e in corrections.entries()]
         return {
             "cfg": self.cfg, "demo": self.demo, "devices": self.devices(), "errors": self.errors(),
             "job": self.job, "engine": engine.status(self.cfg), "design_version": self.design_version,
             "playback": engine.playback() if self.cfg["backend"] == "camilladsp" else None,
             "has_design": self.design is not None, "way_names": config.WAY_NAMES,
             "wiring_ok": len(self.cfg["ways"]) == 1 or self.cfg["wiring_confirmed"] == config.wiring_key(self.cfg),
+            "corrections": saved, "settings_version": self.settings_version, "correction_note": self.note,
+            "unapplied": self.unapplied(),
         }
+
+    def unapplied(self):
+        """Whether the result on the page is not the correction in use: changed settings, or
+        a new measurement, that have not been applied."""
+        if self.design is None or self.note:
+            return False
+        try:
+            meta = corrections.get(corrections.active())
+        except ValueError:
+            return True
+        return (meta.get("settings") != corrections.settings_of(self.cfg)
+                or meta.get("measurement") != self.meas_id or meta.get("layout") != self.layout())
+
+    # ---- saved corrections -------------------------------------------------
+    def summary(self):
+        """A line about what shapes the correction, for the list of saved corrections."""
+        c, t = self.cfg, self.cfg["target"]
+        name = TARGETS.get((float(t["tilt"]), float(t["bass_boost"])))
+        parts = [(name + ": " if name else "") + f"tilt {t['tilt']:+g} dB/oct, bass {t['bass_boost']:+g} dB"]
+        if t.get("points"):
+            parts.append("own curve")
+        if t.get("f_min") or t.get("f_max"):
+            parts.append(f"corrects {t.get('f_min') or 'auto'} to {t.get('f_max') or 'auto'} Hz")
+        if len(c["ways"]) > 1:
+            parts.append("crossover " + " / ".join(f"{f:g}" for f in c["crossover"]["freqs"]) + " Hz")
+        if config.sub(c):
+            parts.append(f"subwoofer from {c['sub']['crossover']:g} Hz")
+        n = design.count_changes(c)
+        if n:
+            parts.append(f"{n} change{'s' if n > 1 else ''} by hand")
+        return "; ".join(parts)
+
+    def _record(self, paths):
+        """Keep the correction that was just applied (Apply), with what made it."""
+        meas = config.data_dir() / "measurement.npz"
+        cid = corrections.record(paths, settings=corrections.settings_of(self.cfg), layout=self.layout(),
+                                 measurement=meas if meas.exists() else None, summary=self.summary())
+        self.cfg["correction"], self.note = cid, ""
+        self._save()
+
+    def _save(self):
+        if not self.demo:
+            config.save(self.cfg)
+
+    def _follow(self):
+        """Another saved correction is in use (switched from the phone, the tray icon, or
+        this page): show it, with its settings and measurement, so that it can be changed."""
+        cid = corrections.active()
+        if not cid or cid == self.cfg.get("correction") or self.job["running"]:
+            return
+        with self.lock:
+            try:
+                meta = corrections.get(cid)
+            except ValueError:
+                return
+            self.cfg["correction"], self.note = cid, ""
+            if not (meta.get("settings") and meta.get("measurement")):
+                self.note = ("This saved correction plays as it was saved. It was applied before roomfix kept "
+                             "its settings, so the result below is not the one playing.")
+            elif meta.get("layout") != self.layout():
+                self.note = ("This saved correction was made with another setup (devices or channels). It plays "
+                             "as saved; the result below is not the one playing.")
+            else:
+                corrections.restore_settings(self.cfg, meta["settings"])
+                path, mine = corrections.measurement_file(meta["measurement"]), config.data_dir() / "measurement.npz"
+                if path and self.meas_id != meta["measurement"]:
+                    tmp = mine.with_name("measurement.npz.new")
+                    shutil.copyfile(path, tmp)
+                    config.replace_file(tmp, mine)
+                    self.meas = None
+                    self._load_measurement()  # (designs it)
+                else:
+                    self.redesign()
+            self._save()
+            self.settings_version += 1
+
+    def use_correction(self, cid):
+        """Switch to a saved correction. Returns a message for the user."""
+        with self.lock:
+            if self.job["running"]:
+                raise RuntimeError("Wait until the measurement has finished.")
+            corrections.use(cid, backend=self.cfg["backend"])
+        message = engine.switch_to_files(self.cfg)
+        self._follow()
+        return message
+
+    def rename_correction(self, cid, name):
+        corrections.rename(cid, name)
+
+    def delete_correction(self, cid):
+        corrections.delete(cid)
 
     # ---- actions ---------------------------------------------------------
     def set_config(self, new):
         with self.lock:
             if self.job["running"]:
                 raise RuntimeError("Wait until the measurement has finished.")
+            errs = config.adjust_errors(new.get("adjust", self.cfg["adjust"]))
+            if errs:
+                raise RuntimeError(errs[0])
             for key in config.DEFAULT:
-                if key in new and key not in ("wiring_confirmed", "mic_cal_name"):
+                if key in new and key not in ("wiring_confirmed", "mic_cal_name", "correction"):
                     self.cfg[key] = new[key]
-            if not self.demo:
-                config.save(self.cfg)
+            self._save()
             self.redesign()
 
     def set_calibration(self, name, text):
@@ -128,7 +238,8 @@ class App:
     def apply(self):
         if self.design is None:
             raise RuntimeError("Measure first.")
-        return engine.apply(self.cfg, self.design, self.channels())
+        corrections.ensure()  # (keeps the correction applied before there was a history)
+        return engine.apply(self.cfg, self.design, self.channels(), written=self._record)
 
     def start(self, action, auto_apply=True):
         with self.lock:
@@ -185,8 +296,12 @@ class App:
                     meas = m.measure()
                     meas["layout"] = self.layout()
                     self.meas = meas
-                    if not self.demo:
-                        self._save_measurement()
+                    self._save_measurement()  # (the demo's: in its own temporary folder)
+                    # changes by hand were made for the previous measurement; it is kept,
+                    # with them, in the saved corrections
+                    self.cfg["adjust"] = copy.deepcopy(config.DEFAULT["adjust"])
+                    self._save()
+                    self.settings_version += 1
                     self.redesign()
                 if action in ("measure", "verify"):
                     if self.design is None:
@@ -226,6 +341,7 @@ def make_handler(app):
             return host in ("127.0.0.1", "localhost")
 
         def do_GET(self):
+            app.seen = time.monotonic()
             if not self._local():
                 return self._send(403, {"error": "forbidden"})
             path = self.path.split("?")[0]
@@ -239,6 +355,7 @@ def make_handler(app):
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            app.seen = time.monotonic()
             # the custom header keeps other websites from triggering actions
             if not self._local() or self.headers.get("X-Roomfix") != "1":
                 return self._send(403, {"error": "forbidden"})
@@ -261,6 +378,12 @@ def make_handler(app):
                     message = engine.bypass(app.cfg)
                 elif self.path in ("/api/volume", "/api/mute", "/api/source"):
                     engine.set_playback(self.path, body)
+                elif self.path == "/api/correction/use":
+                    message = app.use_correction(body.get("id"))
+                elif self.path == "/api/correction/rename":
+                    app.rename_correction(body.get("id"), body.get("name", ""))
+                elif self.path == "/api/correction/delete":
+                    app.delete_correction(body.get("id"))
                 else:
                     return self._send(404, {"error": "not found"})
                 self._send(200, {"ok": True, "message": message, "state": app.state()})

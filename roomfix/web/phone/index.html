@@ -62,6 +62,11 @@
              border-radius: 18px; background: var(--page); border: 1px solid var(--line); }
   .sources button { min-height: 52px; font-size: 17px; background: transparent; color: var(--ink2); border-radius: 14px; }
   .sources button[aria-pressed=true] { background: var(--on-soft); color: var(--on); }
+  .presets { display: grid; gap: 8px; }
+  .presets button { min-height: 52px; font-size: 17px; text-align: left; padding: 8px 16px; overflow-wrap: anywhere;
+                    background: transparent; border: 1px solid var(--line); color: var(--ink); }
+  .presets button[aria-pressed=true] { background: var(--on-soft); color: var(--on); border-color: var(--on); }
+  .presets button[aria-pressed=true]::after { content: " ✓"; }
   .actions { display: grid; gap: 10px; margin-top: 14px; }
   .actions button { font-size: 16px; min-height: 48px; background: transparent; border: 1px solid var(--line); }
   .actions button.primary { background: var(--on); color: #fff; border-color: var(--on); }
@@ -95,6 +100,11 @@
     <h2>Source</h2>
     <div class="sources" id="sources" role="group" aria-label="Source"></div>
     <p class="note" id="source-note"></p>
+  </section>
+  <section class="card" id="preset-card" hidden>
+    <h2>Correction</h2>
+    <div class="presets" id="presets" role="group" aria-label="Saved corrections"></div>
+    <p class="note">The corrections saved with a name on the PC. Switching keeps the music playing.</p>
   </section>
   <section class="card">
     <h2>Output devices</h2>
@@ -219,6 +229,7 @@ function render(s) {
   $("power").textContent = s.enabled ? "Switch correction off" : "Switch correction on";
   $("power").classList.toggle("primary", !s.enabled);
   renderSources(s);
+  renderPresets(s);
   $("engines").replaceChildren(...s.engines.map((e) => {
     const row = document.createElement("div"), left = document.createElement("div");
     const name = document.createElement("div"), detail = document.createElement("div");
@@ -258,6 +269,35 @@ $("mute").onclick = () => {
   optimistic((s) => { s.mute = mute; });
   run(api("/api/mute", { mute }));
 };
+// The saved corrections with a name (and the one in use, if it has none). Shown only once
+// there is a preset to switch to; an older roomfix on the PC sends none.
+function renderPresets(s) {
+  const list = s.corrections || [];
+  $("preset-card").hidden = !list.some((c) => c.name);
+  if ($("preset-card").hidden) return;
+  const key = JSON.stringify(list.map((c) => [c.id, c.name]));
+  if ($("presets").dataset.key !== key) {
+    $("presets").dataset.key = key;
+    $("presets").replaceChildren(...list.map((c) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.id = c.id;
+      button.textContent = c.name || "Unnamed (in use)";
+      button.onclick = () => usePreset(c.id);
+      return button;
+    }));
+  }
+  for (const button of $("presets").children)
+    button.setAttribute("aria-pressed", list.some((c) => c.id === button.dataset.id && c.active));
+}
+
+// absolute: switching to the one in use changes nothing
+function usePreset(id) {
+  if (!S || (S.corrections || []).some((c) => c.id === id && c.active)) return;
+  optimistic((s) => { for (const c of s.corrections) c.active = c.id === id; });
+  run(api("/api/correction", { id }));
+}
+
 // absolute like the volume: sending it twice changes nothing
 function setSource(name) {
   if (!S || S.source === name) return;

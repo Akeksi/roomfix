@@ -11,6 +11,9 @@ A background process (`roomfix --engine`), started by "Apply correction" and at 
   every output device) and, if set up, "TV App" (the TV plays its own apps on its own
   speakers and sends the sound over S/PDIF; only the subwoofer's engine runs, from that
   input). Only the engines of the chosen source run;
+- switches to a saved correction (from the phone, the tray icon or the roomfix page): its
+  engine files are put in place and every running engine reloads its configuration,
+  which takes effect without a pause while the output devices stay the same;
 - serves a small HTTP API on 127.0.0.1 for the roomfix page and for hotkey scripts, and
   a page for the phone, which `tailscale serve` can make reachable from the tailnet.
 """
@@ -31,7 +34,7 @@ from pathlib import Path
 
 import yaml
 
-from . import config, engine
+from . import config, corrections, engine
 
 PORT = 8136  # of the HTTP API, if free. The one in use is in engine.json.
 MIN_DB, MAX_DB = -60.0, 0.0
@@ -179,6 +182,36 @@ class Engine:
         self.stop()
         self.next_try, self.retry = now, RETRY_MIN
 
+    def reload(self, now):
+        """Take up the new contents of the configuration file. A running engine swaps its
+        processing without stopping; one that refuses the file is started again with it."""
+        try:
+            self.device = self._playback(self._conf()).get("device") or ""
+        except Exception:
+            pass
+        if self.proc is None or self.proc.poll() is not None:
+            self.next_try, self.retry = now, RETRY_MIN  # (starts with the new file)
+            return
+        # a saved correction names the devices as they were called then: their names of
+        # today go into the file first ("1 - TV" is now "2 - TV"), or the engine would let go
+        # of its device to look for the old name
+        try:
+            missing = self._missing()
+        except Exception:
+            missing = None
+        if missing:
+            log.info("the new configuration needs %s, which is not connected", missing)
+            return self.restart(now)
+        reply = self.sup.ask(self.port, "Reload")
+        if reply and reply.get("result") == "Ok":
+            log.info("engine for %s reloaded its configuration", self.device or self.path.name)
+            self.sent = None  # give it the volume again, to be sure
+            self.push()
+        else:
+            log.warning("engine for %s did not reload (%s): starting it again", self.device or self.path.name,
+                        (reply or {}).get("result"))
+            self.restart(now)
+
     def check(self, now):
         if self.proc is not None and self.proc.poll() is not None:
             self._failed(now, "stopped" + self._last_error())
@@ -242,14 +275,20 @@ class Supervisor:
         self.mute = bool(saved.get("mute", False))
         self.enabled = bool(saved.get("enabled", True))  # off: engines stopped, the tray icon stays
         self.keys = bool(saved.get("keys", True))  # the volume keys of the keyboard set this volume
+        self.engine_lock = threading.RLock()  # the loop and a reload both change the engines
+        self._build(self.files, tv_app)
+        # the source chosen last time; PC if the TV App source is no longer set up
+        self.source = saved.get("source") if saved.get("source") in self.groups else "pc"
+        self._restart = False
+        self.switched = None  # (id, when) of the last switch to a saved correction
+        self.listeners = []  # told when the API changed the volume, mute or power: the tray shows it
+
+    def _build(self, files, tv_app):
+        self.files, self.tv_app = list(files), tv_app
         ports = _free_ports(len(self.files) + (1 if tv_app else 0))
         self.groups = {"pc": [Engine(self, path, port) for path, port in zip(self.files, ports)]}
         if tv_app:
             self.groups["tv_app"] = [Engine(self, Path(tv_app), ports[-1], listen=True)]
-        # the source chosen last time; PC if the TV App source is no longer set up
-        self.source = saved.get("source") if saved.get("source") in self.groups else "pc"
-        self._restart = False
-        self.listeners = []  # told when the API changed the volume, mute or power: the tray shows it
 
     @property
     def engines(self):
@@ -272,6 +311,10 @@ class Supervisor:
 
     def check(self):
         """One round of the supervisor's loop: look after every engine."""
+        with self.engine_lock:
+            self._check()
+
+    def _check(self):
         now = self.clock()
         restart, self._restart = self._restart, False
         source, freed = self.source, False  # (the API may switch the source meanwhile)
@@ -298,8 +341,43 @@ class Supervisor:
                 log.exception("engine check failed")
 
     def stop(self):
-        for eng in self._all():
-            eng.stop()
+        with self.engine_lock:
+            for eng in self._all():
+                eng.stop()
+
+    def reload(self, files=None, tv_app=None):
+        """The applied correction's files have changed: every engine takes up its new
+        configuration. Without a pause, unless the output devices are no longer the same
+        set of files (say a subwoofer on its own device was added): then they start anew."""
+        if files is None:
+            files, tv_app = engine._yamls(), next(iter(engine._tv_app_files()), None)
+        if not files:
+            raise ValueError("no correction has been applied")
+        with self.engine_lock:
+            now = self.clock()
+            if list(map(Path, files)) == list(map(Path, self.files)) and bool(tv_app) == bool(self.tv_app):
+                for eng in self._all():
+                    eng.reload(now)
+            else:
+                log.info("the correction has other output devices: starting the engines anew")
+                for eng in self._all():
+                    eng.stop()
+                self._build(files, tv_app)
+                if self.source not in self.groups:
+                    self.source = "pc"
+                    with self.lock:
+                        self._changed()
+        return self.status()
+
+    def use_correction(self, cid):
+        """Switch to a saved correction: its engine files in place, and the engines reload."""
+        if not isinstance(cid, str):
+            raise ValueError('send {"id": "<id of a saved correction>"}')
+        with self.engine_lock:
+            meta = corrections.use(cid, backend="camilladsp")
+            log.info("using the saved correction %s", meta.get("name") or cid)
+            self.switched = (cid, time.monotonic())  # the tray icon says which
+            return self.reload()
 
     def _changed(self):
         self._volume_file().write_text(json.dumps({"volume": self.volume, "mute": self.mute, "enabled": self.enabled,
@@ -369,6 +447,7 @@ class Supervisor:
         return {"volume": self.volume, "mute": self.mute, "min_db": MIN_DB, "max_db": MAX_DB,
                 "enabled": self.enabled, "keys": self.keys, "step_db": STEP_DB,
                 "source": self.source, "sources": {name: SOURCES[name] for name in self.groups},
+                "correction": corrections.active(),
                 "engines": [{"device": e.device, "status": e.status, "detail": e.detail, "signal": e.signal}
                             for e in self.engines]}
 
@@ -455,6 +534,18 @@ def _file(path):
     return None
 
 
+def _with_presets(status):
+    """The status, with the saved corrections that can be switched to: the presets (those
+    with a name) and the one in use."""
+    try:
+        status["corrections"] = [{"id": e["id"], "name": e["name"], "active": e["active"]}
+                                 for e in corrections.presets() if e["backend"] == "camilladsp"]
+    except OSError:
+        log.exception("saved corrections could not be listed")
+        status["corrections"] = []
+    return status
+
+
 def _handler(sup):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -476,7 +567,7 @@ def _handler(sup):
                 return self._send(403, {"error": "forbidden"})
             path = self.path.split("?")[0]
             if path == "/api/status":
-                return self._send(200, sup.status())
+                return self._send(200, _with_presets(sup.status()))
             file = _file(path)
             if file:
                 return self._send(200, *file)
@@ -509,6 +600,10 @@ def _handler(sup):
                     if not isinstance(body.get("name"), str):
                         raise ValueError('send {"name": "pc"} or {"name": "tv_app"}')
                     result = sup.set_source(body["name"])
+                elif path == "/api/correction":
+                    result = sup.use_correction(body.get("id"))
+                elif path == "/api/reload":
+                    result = sup.reload()
                 elif path == "/api/quit":
                     if not local_host(host):  # from the phone there would be no way to start it again
                         return self._send(403, {"error": "forbidden: quit from this computer"})
@@ -516,11 +611,14 @@ def _handler(sup):
                     result = {"ok": True}
                 else:
                     return self._send(404, {"error": "not found"})
-                if path in ("/api/volume", "/api/mute", "/api/power", "/api/source"):
+                if path in ("/api/volume", "/api/mute", "/api/power", "/api/source", "/api/correction"):
                     sup.notify()
-                self._send(200, result)
+                self._send(200, _with_presets(result) if "engines" in result else result)
             except (ValueError, KeyError, TypeError) as exc:
                 self._send(400, {"error": str(exc)})
+            except OSError as exc:  # a file of the correction could not be written
+                log.exception("request %s failed", self.path)
+                self._send(500, {"error": str(exc)})
 
     return Handler
 
@@ -585,6 +683,7 @@ def main():
     if request("/api/status") is not None or not files:
         return  # already running, or no correction has been applied
     try:
+        corrections.ensure()  # the correction applied before there was a history: a preset
         sup = Supervisor(files, tv_app=next(iter(engine._tv_app_files()), None))
         icon = None
         if sys.platform == "win32":
@@ -629,11 +728,12 @@ def request(path, body=None, timeout=1.5):
 
 
 def command(page=False):
-    """The command line that starts the supervisor, or (page=True) the roomfix page."""
-    args = [] if page else ["--engine"]
+    """The command line that starts the supervisor, or (page=True) the roomfix page from the
+    tray icon: without a window, closing by itself once the page has been closed a while."""
+    args = ["--from-tray"] if page else ["--engine"]
     if getattr(sys, "frozen", False):  # roomfix.exe
         return [sys.executable, *args]
-    exe = os.path.join(os.path.dirname(sys.executable), "python.exe" if page else "pythonw.exe")
+    exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     return [exe if os.path.exists(exe) else sys.executable, "-m", "roomfix", *args]
 
 
@@ -653,14 +753,34 @@ def start(timeout=25.0):
     flags = 0x00000008 | 0x00000200 if sys.platform == "win32" else 0  # detached, own process group
     subprocess.Popen(command(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      creationflags=flags, close_fds=True)
-    end, status = time.monotonic() + timeout, None
-    while time.monotonic() < end:
+    return wait_ready(timeout)
+
+
+def _ready(status):
+    return bool(status) and all(e["status"] in ("running", "waiting") or e.get("signal") is False
+                                for e in status["engines"])  # (a TV that is off sends nothing)
+
+
+def wait_ready(timeout=25.0, status=None):
+    """The supervisor's status once its engines are up or waiting for their devices (or
+    the last one seen, when that takes longer than timeout)."""
+    end = time.monotonic() + timeout
+    while not _ready(status) and time.monotonic() < end:
         time.sleep(0.3)
-        status = request("/api/status")
-        if status and all(e["status"] in ("running", "waiting") or e.get("signal") is False
-                          for e in status["engines"]):  # (a TV that is off sends nothing)
-            break
+        status = request("/api/status") or status
     return status
+
+
+def reload():
+    """Tell a running supervisor that the applied correction's files have changed, and switch
+    the correction on. Returns its status once the engines are ready, or None if no
+    supervisor answers."""
+    status = request("/api/reload", {}, timeout=15)
+    if status is None:
+        return None
+    if not status.get("enabled"):
+        status = request("/api/power", {"on": True}) or status
+    return wait_ready(status=status)
 
 
 def stop(timeout=8.0):

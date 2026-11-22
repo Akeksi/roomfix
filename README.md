@@ -42,9 +42,35 @@ No hardware at hand? `roomfix --demo` runs everything against simulated speakers
 3. **Result**: adjust the target curve (tilt, bass boost, limits, or your own
    curve) or the crossover; the correction updates instantly, without
    measuring again. Press **Apply correction** to use it.
+4. **Saved corrections**: every applied correction is kept. Name the ones you
+   like and switch between them, also from the phone and the tray icon.
 
 Using several microphone positions (Setup) makes the correction valid for a
 wider listening area.
+
+## Saved corrections and changes by hand
+
+- **Saved corrections** (section 4 of the page). Each correction you apply is
+  kept with what shaped it: target curve, crossover, changes by hand and the
+  measurement. Give one a name to keep it as a preset; of those without a name,
+  the last 20 are kept. **Use** switches back to one, and the page shows its
+  settings again, ready to change. Presets can also be switched from the phone
+  page and from the tray icon's menu. The correction that was applied before
+  roomfix kept a history is kept as the preset "Earlier correction".
+- **Changes by hand** (under the result). The level, delay and polarity of each
+  speaker, of each driver of an active speaker, and of the subwoofer, on top of
+  what was measured. Each changed value is marked and can be reset. The EQ is
+  not fitted to them, so it does not undo them, and the predicted response on
+  the charts includes them. Raising a level makes everything else that much
+  quieter, so that loud passages do not clip; making something earlier delays
+  the others instead. A new measurement starts without changes by hand; the
+  corrections saved before keep theirs. The TV App source keeps its own
+  settings, set by ear in Setup.
+- With CamillaDSP, **Apply** and switching between saved corrections take
+  effect without a pause: the running engines reload the new correction. Only
+  when the output devices change (say, a subwoofer added on its own device) do
+  they start anew. CamillaDSP checks every new correction first; one it refuses
+  never replaces the one that plays.
 
 ## Subwoofer and a second output device
 
@@ -65,8 +91,9 @@ each speaker together with the subwoofer through the running engines.
   volume controls of TV, amplifier and subwoofer where they are: they set the
   balance between speakers and subwoofer. Listen louder or quieter with the
   volume keys of the keyboard, which roomfix takes over (see below).
-- After the engines start (at login, when you press Apply, or when a device
-  returns), the devices need up to a minute to settle into exact alignment.
+- After the engines start (at login, when a device returns, or when Apply
+  changes the output devices), the devices need up to a minute to settle into
+  exact alignment.
 - Known limit: the latency of an output device can differ by a few
   milliseconds from one engine start to the next. roomfix measures the result
   through the running engines and warns if subwoofer and speakers do not add
@@ -132,12 +159,15 @@ with Windows", at login. The roomfix page does not need to be open.
   above 0 dB. The page has a slider and a mute button for the same volume.
 - **Icon in the notification area** (bottom right). Its colour shows the state:
   on, muted, waiting for a device, or off. Click it for the menu: mute, volume,
-  open roomfix, restart the engines, switch the correction off and on, give the
-  volume keys back to Windows, open the log folder, or close it all. With the
-  TV App source set up, the menu also switches between PC and TV App.
+  saved corrections, open roomfix, restart the engines, switch the correction
+  off and on, give the volume keys back to Windows, open the log folder, or
+  close it all. With the TV App source set up, the menu also switches between
+  PC and TV App. "Open roomfix" opens the page in the browser without a window
+  of its own; roomfix closes by itself half an hour after the page is closed.
 - **Phone.** The background process also serves a page for the phone at
   `http://127.0.0.1:8136/`: volume slider, ± buttons, mute, on/off, the source (if
-  TV App is set up) and the state of each output device. To reach it from your phone, put the PC and the phone in the
+  TV App is set up), the saved corrections with a name, and the state of each
+  output device. To reach it from your phone, put the PC and the phone in the
   same [Tailscale](https://tailscale.com) network and run, once, on the PC:
   `tailscale serve --bg 8136`. Then open `https://<pc>.<tailnet>.ts.net` on the
   phone and add it to the home screen. Changes made there show on the PC's screen
@@ -148,7 +178,9 @@ with Windows", at login. The roomfix page does not need to be open.
   `POST /api/volume {"value": -20}` (add `"unmute": true` to unmute too) or
   `{"delta": -2}`, `POST /api/mute {"mute": true}` (or `{}` to toggle),
   `POST /api/restart {}`, `POST /api/power {"on": false}`,
-  `POST /api/source {"name": "tv_app"}` (or `"pc"`), `GET /api/status`.
+  `POST /api/source {"name": "tv_app"}` (or `"pc"`),
+  `POST /api/correction {"id": "<id>"}` (the presets and their ids are in
+  `corrections` of `GET /api/status`), `GET /api/status`.
   Absolute values are safe to send again when a request got no answer.
 
 ## Active crossovers and driver safety

@@ -11,7 +11,7 @@ import zlib
 
 import numpy as np
 
-from . import config
+from . import config, corrections
 
 log = logging.getLogger("roomfix.engine")
 COLORS = {"on": (60, 190, 140), "muted": (235, 160, 50), "waiting": (225, 85, 85), "off": (130, 136, 142)}
@@ -37,6 +37,14 @@ def summary(status):
     if status["mute"]:
         return "muted", f"{name}: muted ({status['volume']:.1f} dB)"
     return "on", f"{name}: {status['volume']:.1f} dB"
+
+
+def correction_label(cid):
+    try:
+        name = corrections.get(cid).get("name")
+    except ValueError:
+        name = ""
+    return "Correction: " + (name or "unnamed")
 
 
 # ---- icons ---------------------------------------------------------------
@@ -130,6 +138,7 @@ def _win32():
     P = ctypes.POINTER
     sig(k, "GetModuleHandleW", w.HMODULE, w.LPCWSTR)
     sig(u, "RegisterClassW", w.ATOM, P(WndClass))
+    sig(u, "UnregisterClassW", w.BOOL, w.LPCWSTR, w.HINSTANCE)
     sig(u, "CreateWindowExW", w.HWND, w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID)
     sig(u, "DefWindowProcW", lresult, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
@@ -225,6 +234,7 @@ class Tray:
         self.osd_text, self.osd_bar = "", None
         self.icons, self.shown, self.hot = {}, None, False
         self.source_seen = self.sup.status().get("source")
+        self.switch_seen = self.sup.switched
         self.taskbar_created = u.RegisterWindowMessageW("TaskbarCreated")
         self._icon(add=True)
         self._refresh()
@@ -234,6 +244,10 @@ class Tray:
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             u.TranslateMessage(ctypes.byref(msg))
             u.DispatchMessageW(ctypes.byref(msg))
+        # the classes point to this object's window procedure: an icon made later in the same
+        # process must register its own, not call this one once it is gone
+        for name in ("roomfix-tray", "roomfix-osd"):
+            u.UnregisterClassW(name, self.instance)
 
     def _message(self, hwnd, msg, wparam, lparam):
         try:
@@ -318,11 +332,21 @@ class Tray:
             if status.get("source") != self.source_seen:  # switched: say to what
                 self.source_seen = status.get("source")
                 return self._show(f"Source: {source_name(status) or 'PC'}", None)
+            if self.sup.switched != self.switch_seen:  # to a saved correction: say which
+                self.switch_seen = self.sup.switched
+                return self._show(correction_label(self.switch_seen[0]), None)
             if not status["enabled"]:
                 return self._show("Correction switched off", None)
             level = (status["volume"] - status["min_db"]) / (status["max_db"] - status["min_db"])
             text = f"{status['volume']:.1f} dB"
             self._show(f"Muted ({text})" if status["mute"] else text, 0.0 if status["mute"] else level)
+
+    def _use(self, cid):
+        try:
+            self._act(lambda: self.sup.use_correction(cid))
+        except (OSError, ValueError) as exc:
+            log.warning("could not switch to the saved correction %s: %s", cid, exc)
+            self._show("Could not switch the correction", None)
 
     # ---- menu ------------------------------------------------------------------
     def _menu(self):
@@ -351,6 +375,12 @@ class Tray:
                 item(top, SOURCE_ITEMS.get(name, sources[name]),
                      lambda name=name: self._act(lambda: self.sup.set_source(name)), checked=status["source"] == name)
             u.AppendMenuW(top, MF_SEPARATOR, 0, None)
+        saved = [e for e in corrections.presets() if e["backend"] == "camilladsp"]
+        if any(e["name"] for e in saved):  # presets to choose from
+            pick = menu()
+            for e in saved:
+                item(pick, e["name"] or "Unnamed (in use)", lambda cid=e["id"]: self._use(cid), checked=e["active"])
+            u.AppendMenuW(top, MF_POPUP, pick, "Saved corrections")
         item(top, "Mute", lambda: self._act(self.sup.set_mute), checked=on and status["mute"], enabled=on)
         for db in (-10, -20, -30, -40):
             item(vol, f"{db} dB", lambda db=db: self._act(lambda: self.sup.set_volume(value=db)))
@@ -381,9 +411,8 @@ class Tray:
     def _open_page():
         """Open the roomfix page: starts roomfix, which points to a running one if there is."""
         from . import supervisor
-        info = subprocess.STARTUPINFO()
-        info.dwFlags, info.wShowWindow = 1, 7  # its console window: minimized, without taking the focus
-        subprocess.Popen(supervisor.command(page=True), creationflags=0x10, startupinfo=info)  # own console
+        subprocess.Popen(supervisor.command(page=True), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, creationflags=0x08000000, close_fds=True)  # no window
 
     # ---- on-screen display ---------------------------------------------------
     def _show(self, text, bar):

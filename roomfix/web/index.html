@@ -102,6 +102,7 @@
       <button id="apply" class="primary" type="button">Apply correction</button>
       <button id="bypass" type="button">Turn correction off</button>
       <button id="verify" type="button">Measure result again</button>
+      <span id="unapplied" class="chip bad" hidden>Changed: not applied yet</span>
       <span id="apply-msg" class="muted"></span>
     </div>
     <ul id="warnings" class="errors"></ul>
@@ -128,10 +129,26 @@
         <button id="points-file-btn" type="button">Load file</button><input id="points-file" type="file" hidden></p>
       <textarea id="points" rows="5" spellcheck="false"></textarea>
     </details>
+    <h3 data-help="On top of what was measured: for a whole speaker, one of its drivers, or the subwoofer. The EQ is not fitted to them, so it does not undo them. Press Apply correction to hear them: while the output devices stay the same, the correction changes without a pause. A new measurement starts without them; the corrections saved before keep theirs.">Changes by hand</h3>
+    <p class="muted">Level in dB (+ is louder), delay in ms (+ is later; 1 ms is 34 cm of distance), and polarity. The measured values are on the right.</p>
+    <div class="scroll"><table id="adjust" class="adjust"></table></div>
+    <div class="row"><button id="adjust-reset" type="button">Back to the measured values</button></div>
     <h3>Applied settings</h3>
     <div id="summary"></div>
   </section>
+
+  <section id="saved" class="card" hidden>
+    <h2>4 · Saved corrections</h2>
+    <p class="muted">Every applied correction is kept here, with its target curve, crossover and changes by hand.
+      Give one a name to keep it as a preset: presets can also be switched from the phone and from the icon in the
+      notification area. Of those without a name, the last 20 are kept.</p>
+    <p id="correction-note" class="result" hidden></p>
+    <div class="scroll"><table id="saved-list" class="saved"></table></div>
+    <p id="saved-msg" class="muted"></p>
+  </section>
 </main>
+<div id="closed" class="closed" role="status" hidden>roomfix has been closed. Open it again from its icon in the
+  notification area (bottom right), or start roomfix.</div>
 <div id="tip" class="tip" hidden></div>
 <div id="help" class="help" role="tooltip" hidden></div>
 <script src="app.js"></script>
