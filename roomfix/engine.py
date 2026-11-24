@@ -504,8 +504,11 @@ def _request(port, command):
             if size == 126:
                 size = struct.unpack(">H", stream.read(2))[0]
             reply = next(iter(json.loads(stream.read(size)).values()))
-            sock.sendall(bytes([0x88, 0x80]) + mask)  # say goodbye, or every request leaves a
-            stream.read(2)                            # "lost connection" warning in the engine's log
+            try:  # say goodbye, or every request leaves a "lost connection" warning in the
+                sock.sendall(bytes([0x88, 0x80]) + mask)  # engine's log. The answer is in
+                stream.read(2)                            # already, even if this fails.
+            except OSError:
+                pass
             return reply if isinstance(reply, dict) else None
     except (OSError, ValueError, IndexError, AttributeError, StopIteration):
         return None

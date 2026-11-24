@@ -40,6 +40,11 @@ PORT = 8136  # of the HTTP API, if free. The one in use is in engine.json.
 MIN_DB, MAX_DB = -60.0, 0.0
 STEP_DB = 2.0  # of a volume key; half of it with Shift
 RETRY_MIN, RETRY_MAX = 2.0, 30.0  # seconds before a failed engine is started again
+# An engine counts as hung once it has not answered for this many seconds and this many
+# questions in a row. One missed answer is no sign of trouble: a question can be lost on
+# the way (AdGuard resets connections to 127.0.0.1) or come back late when the computer is
+# busy, and starting the engine again for it cuts the sound for a moment.
+HUNG_S, HUNG_MISSES = 10.0, 3
 SOURCES = {"pc": "PC", "tv_app": "TV App"}
 SIGNAL_DB = -80.0  # a peak above this on the S/PDIF input is sound
 QUIET_S = 10.0  # seconds without sound before "no signal" is shown
@@ -97,6 +102,7 @@ class Engine:
         self.sup, self.path, self.port = sup, path, port
         self.proc, self.status, self.detail = None, "stopped", ""
         self.next_try, self.retry, self.started = 0.0, RETRY_MIN, 0.0
+        self.answered, self.misses = 0.0, 0  # when it last answered; questions unanswered since
         self.sent = None  # (volume, mute) the engine has
         # listen: tell when no sound arrives (the TV's S/PDIF input; silence on the virtual
         # cable just means that nothing plays). signal: True, False, or None = not known.
@@ -149,6 +155,7 @@ class Engine:
         volume, mute = self.sup.volume, self.sup.mute
         self.proc = self.sup.spawn(self.path, self.port, volume, mute)
         self.sent, self.started, self.status, self.detail = (volume, mute), now, "starting", ""
+        self.answered, self.misses = now, 0  # (it has this long to open its API)
         self.signal, self.heard = None, now
 
     def _failed(self, now, why):
@@ -221,10 +228,21 @@ class Engine:
             return
         state = (self.sup.ask(self.port, "GetState") or {}).get("value")
         if state is None:
-            if now - self.started > 10:
+            self.misses += 1
+            if self.misses >= HUNG_MISSES and now - self.answered > HUNG_S:
+                silent = now - self.answered
+                why = self._last_error() if self.answered == self.started else ""  # (this run's log)
                 self.stop()
-                self._failed(now, "did not answer")
+                if "websocket server" in why.lower():
+                    # another program holds its port: CamillaDSP plays on, but without its
+                    # API, and would do so again on the same port
+                    self.port = _free_ports(1)[0]
+                self._failed(now, f"did not answer for {silent:.0f} s{why}")
             return
+        if self.misses and self.answered > self.started:  # (not while it was starting)
+            log.info("engine for %s answers again, after %d unanswered question(s) in %.0f s",
+                     self.device or self.path.name, self.misses, now - self.answered)
+        self.answered, self.misses = now, 0
         if state == "Inactive":
             reason = (self.sup.ask(self.port, "GetStopReason") or {}).get("value")
             self.stop()

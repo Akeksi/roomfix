@@ -18,6 +18,7 @@ from roomfix import engine, supervisor
 class Proc:
     def __init__(self):
         self.code = None
+        self.hung = False  # the process lives, but answers nothing
 
     def poll(self):
         return self.code
@@ -39,10 +40,18 @@ class World:
         self.peak = -20.0  # dBFS of what arrives at the engines' inputs
         self.clashes = []  # an engine started on a device that another running engine holds
         self.reloaded, self.reload_ok = [], True  # engines told to read their configuration again
+        # until then (and at that time) no question reaches the engines, which play on: a
+        # network filter resets the connections, or the computer is too busy to answer in time
+        self.deaf = -1.0
+        self.taken = set()  # ports another program holds: an engine there has no API
 
     def spawn(self, path, port, volume, mute):
         proc = Proc()
         proc.device = yaml.safe_load(path.read_text())["devices"]["playback"]["device"]
+        proc.hung = port in self.taken
+        path.with_suffix(".log").write_text(  # (CamillaDSP starts its log anew)
+            "ERROR [camillalib::socketserver] <src\\socketserver.rs:568> Failed to start websocket server: "
+            "address in use (os error 10048)\n" if proc.hung else "")
         self.clashes += [proc.device for other in self.by_port.values()
                          if other.code is None and other.device == proc.device]
         self.spawned.append((path.name, volume, mute))
@@ -51,7 +60,7 @@ class World:
 
     def ask(self, port, command):
         proc = self.by_port.get(port)
-        if proc is None or proc.code is not None:
+        if proc is None or proc.code is not None or proc.hung or self.now <= self.deaf:
             return None
         if command == "Exit":
             proc.code = 0
@@ -255,6 +264,86 @@ def test_stopped_or_hung_engine_is_restarted_with_growing_pauses(tmp_path, monke
     world.state = "Running"
     world.run(sup, 40)
     assert statuses(sup) == ["running"]
+
+
+def test_an_unanswered_question_does_not_restart_the_engine(tmp_path, monkeypatch, caplog):
+    """Now and then a question to an engine goes unanswered for a second or a few while the
+    engine plays on. Each restart for it was a dropout of the sound (24.11.: the subwoofer's
+    engine every 30 to 180 minutes)."""
+    caplog.set_level("INFO", logger="roomfix.engine")
+    world, sup = setup(tmp_path, monkeypatch)
+    world.run(sup, 120)
+    procs = [e.proc for e in sup.engines]
+    for gap in (1, 1, 2, 5, 1):  # seconds without an answer, half an hour apart
+        world.deaf = world.now + gap
+        world.run(sup, 1800)
+    assert [e.proc for e in sup.engines] == procs and len(world.spawned) == 2
+    assert statuses(sup) == ["running", "running"]
+    assert "answers again, after 5 unanswered question(s) in 6 s" in caplog.text
+    assert "did not answer" not in caplog.text
+
+
+def test_engine_that_stops_answering_is_restarted(tmp_path, monkeypatch):
+    world, sup = setup(tmp_path, monkeypatch, devices=("USB DAC",))
+    world.run(sup, 120)
+    hung = sup.engines[0].proc
+    hung.hung = True
+    world.run(sup, supervisor.HUNG_S)
+    assert sup.engines[0].proc is hung  # (it may still answer)
+    world.run(sup, 6)
+    assert hung.code is not None and sup.engines[0].proc is not hung  # killed, started again
+    assert statuses(sup) == ["running"] and len(world.spawned) == 2
+    # a computer that answers nothing at all for a long while: the engines are started
+    # again, but not once a second
+    world.deaf = world.now + 120
+    world.run(sup, 120)
+    assert "did not answer for" in sup.status()["engines"][0]["detail"]
+    assert 3 <= len(world.spawned) - 2 <= 8
+
+
+def test_engine_whose_port_is_taken_gets_another(tmp_path, monkeypatch):
+    """CamillaDSP plays on without its API when another program holds its websocket port
+    (and says so in its log only). Started again on that port, it would be deaf again."""
+    world, sup = setup(tmp_path, monkeypatch, devices=("USB DAC",))
+    eng = sup.engines[0]
+    holder = socket.socket()  # (so that no new port can be this one)
+    holder.bind(("127.0.0.1", eng.port))
+    try:
+        world.taken.add(eng.port)
+        world.run(sup, 30)
+        assert eng.port not in world.taken and statuses(sup) == ["running"] and len(world.spawned) == 2
+    finally:
+        holder.close()
+
+
+def test_an_answer_counts_even_if_the_goodbye_fails():
+    """engine._request: the answer is in once its frame has arrived. A connection reset
+    while saying goodbye afterwards does not lose it."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+
+    def serve():
+        conn, _ = server.accept()
+        with conn:
+            stream = conn.makefile("rb")
+            while stream.readline().strip():  # the handshake
+                pass
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            head = stream.read(2)
+            stream.read(4 + (head[1] & 0x7F))  # mask and question
+            answer = json.dumps({"GetState": {"result": "Ok", "value": "Running"}}).encode()
+            conn.sendall(bytes([0x81, len(answer)]) + answer)
+            stream.read(2)  # the goodbye: answered with a reset instead of a goodbye
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        assert engine._request(server.getsockname()[1], "GetState") == {"result": "Ok", "value": "Running"}
+    finally:
+        thread.join(5)
+        server.close()
 
 
 def test_volume_goes_to_all_engines_and_survives_restarts(tmp_path, monkeypatch):
@@ -665,6 +754,36 @@ def test_real_engine_is_restarted_and_obeys_the_volume(tmp_path, monkeypatch):
     finally:
         sup.stop()
     assert sup.engines[0].proc is None
+
+
+def test_real_engine_whose_port_is_taken_gets_another(tmp_path, monkeypatch):
+    exe = os.environ.get("CAMILLADSP") or shutil.which("camilladsp")
+    if not exe:
+        pytest.skip("camilladsp binary not available")
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "_exe", lambda: exe)
+    monkeypatch.setattr(supervisor, "HUNG_S", 1.0)
+    path = tmp_path / "camilladsp.yml"
+    path.write_text(yaml.safe_dump({"devices": {
+        "samplerate": 48000, "chunksize": 1024,
+        "capture": {"type": "SignalGenerator", "channels": 2, "signal": {"type": "Sine", "freq": 1000, "level": -40}},
+        "playback": {"type": "File", "channels": 2, "format": "S16_LE", "filename": os.devnull}}}))
+    sup = supervisor.Supervisor([path])
+    taken = sup.engines[0].port
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", taken))
+    holder.listen()
+    try:
+        end = time.monotonic() + 30
+        while time.monotonic() < end and not (sup.engines[0].port != taken and statuses(sup)[0] != "waiting"
+                                              and engine._request(sup.engines[0].port, "GetState")):
+            sup.check()
+            time.sleep(0.2)
+        assert sup.engines[0].port != taken
+        assert engine._request(sup.engines[0].port, "GetState") is not None
+    finally:
+        sup.stop()
+        holder.close()
 
 
 # ---- saved corrections: switching without stopping ---------------------------
