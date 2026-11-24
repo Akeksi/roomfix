@@ -372,9 +372,10 @@ def test_camilladsp_runs_the_tv_app_config_like_the_simulation(with_sub, tmp_pat
         pytest.skip("camilladsp binary not available")
     audio, _, d = with_sub
     [(_, c)] = engine.tv_app_configs(tv_cfg(audio.cfg, delay_ms=1.5, invert=True), d)
-    (tmp_path / "check.yml").write_text(yaml.safe_dump(c, sort_keys=False), encoding="utf-8")
-    check = subprocess.run([exe, "--check", str(tmp_path / "check.yml")], capture_output=True, text=True)
-    assert check.returncode == 0, check.stdout + check.stderr  # as generated, devices and all
+    if os.name == "nt":  # as generated, devices and all (Wasapi exists in the Windows build only)
+        (tmp_path / "check.yml").write_text(yaml.safe_dump(c, sort_keys=False), encoding="utf-8")
+        check = subprocess.run([exe, "--check", str(tmp_path / "check.yml")], capture_output=True, text=True)
+        assert check.returncode == 0, check.stdout + check.stderr
     n_out = c["mixers"]["drivers"]["channels"]["out"]
     x = np.random.default_rng(0).standard_normal((FS, 2)) * 0.1
     x.astype("<f8").tofile(tmp_path / "in.raw")
