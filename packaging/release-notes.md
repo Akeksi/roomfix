@@ -1,10 +1,10 @@
 The first release of roomfix as a Windows program: install it, start it from the Start menu.
 
-**Download `roomfix-setup-0.2.0.exe`** and run it. It installs roomfix for your Windows user
+**Download `roomfix-setup-0.2.1.exe`** and run it. It installs roomfix for your Windows user
 (no administrator rights needed) with a Start menu entry. roomfix opens its page in your
 browser. Windows may warn that the installer is from an unknown publisher (it is not code
 signed): choose "More info", then "Run anyway". Without installing:
-`roomfix-0.2.0-portable.zip`, unpack it and run `roomfix.exe`.
+`roomfix-0.2.1-portable.zip`, unpack it and run `roomfix.exe`.
 
 You also need [VB-CABLE](https://vb-audio.com/Cable/) (for the CamillaDSP engine) and a
 measurement microphone. See the README for the setup.
