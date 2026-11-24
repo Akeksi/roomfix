@@ -38,7 +38,7 @@ jobs:
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
       - name: Build roomfix.exe and the installer
         run: python packaging/build.py
-      - name: Check roomfix.exe (demo: page, API, logo, a measurement)
+      - name: Check roomfix.exe in demo mode (page, API, logo, a measurement)
         run: python packaging/smoke.py dist/roomfix/roomfix.exe
       - uses: actions/upload-artifact@v4
         with:
