@@ -8,9 +8,9 @@ A background process (`roomfix --engine`), started by "Apply correction" and at 
   have given it, and starts the engine again;
 - holds all engines at the same volume and mute, and remembers them;
 - switches between the sources: "PC" (what Windows plays, through the virtual cable, to
-  every output device) and, if set up, "TV App" (the TV plays its own apps on its own
-  speakers and sends the sound over S/PDIF; only the subwoofer's engine runs, from that
-  input). Only the engines of the chosen source run;
+  every output device) and, if set up, "TV App" (what the TV's own apps play, which the TV
+  sends over S/PDIF: the same speakers play it with the correction, or, when they are the
+  TV's own, only the subwoofer's engine runs). Only the engines of the chosen source run;
 - switches to a saved correction (from the phone, the tray icon or the roomfix page): its
   engine files are put in place and every running engine reloads its configuration,
   which takes effect without a pause while the output devices stay the same;
@@ -257,13 +257,20 @@ class Engine:
             self.sent = want
 
 
+def _paths(files):
+    """A list of paths from a list, one path, or None."""
+    if not files:
+        return []
+    return [Path(files)] if isinstance(files, (str, os.PathLike)) else [Path(p) for p in files]
+
+
 class Supervisor:
     def __init__(self, files, spawn=_spawn, ask=None, outputs=_outputs, clock=time.monotonic, tv_app=None,
                  inputs=_inputs):
-        """files: one configuration per output device of the PC source; tv_app: the
-        configuration of the TV App source, if it is set up."""
+        """files: one configuration per output device of the PC source; tv_app: those of the
+        TV App source, if it is set up (a list, or one path)."""
         self.files = list(files)
-        self.tv_app = tv_app
+        self.tv_app = _paths(tv_app)
         self.spawn, self.ask, self.outputs, self.inputs, self.clock = spawn, ask or engine._request, outputs, inputs, clock
         self.lock = threading.Lock()  # volume and mute
         self.quit = threading.Event()
@@ -284,11 +291,12 @@ class Supervisor:
         self.listeners = []  # told when the API changed the volume, mute or power: the tray shows it
 
     def _build(self, files, tv_app):
-        self.files, self.tv_app = list(files), tv_app
-        ports = _free_ports(len(self.files) + (1 if tv_app else 0))
+        self.files, self.tv_app = list(files), _paths(tv_app)
+        ports = _free_ports(len(self.files) + len(self.tv_app))
         self.groups = {"pc": [Engine(self, path, port) for path, port in zip(self.files, ports)]}
-        if tv_app:
-            self.groups["tv_app"] = [Engine(self, Path(tv_app), ports[-1], listen=True)]
+        if self.tv_app:  # (they all hear the same input: one says whether sound arrives)
+            self.groups["tv_app"] = [Engine(self, path, port, listen=i == 0) for i, (path, port)
+                                     in enumerate(zip(self.tv_app, ports[len(self.files):]))]
 
     @property
     def engines(self):
@@ -350,12 +358,12 @@ class Supervisor:
         configuration. Without a pause, unless the output devices are no longer the same
         set of files (say a subwoofer on its own device was added): then they start anew."""
         if files is None:
-            files, tv_app = engine._yamls(), next(iter(engine._tv_app_files()), None)
+            files, tv_app = engine._yamls(), engine._tv_app_files()
         if not files:
             raise ValueError("no correction has been applied")
         with self.engine_lock:
             now = self.clock()
-            if list(map(Path, files)) == list(map(Path, self.files)) and bool(tv_app) == bool(self.tv_app):
+            if list(map(Path, files)) == list(map(Path, self.files)) and _paths(tv_app) == self.tv_app:
                 for eng in self._all():
                     eng.reload(now)
             else:
@@ -520,8 +528,8 @@ def _switch(value):
 
 @functools.lru_cache(maxsize=None)
 def _icon(size):
-    from . import tray
-    return tray.app_icon(size)
+    from . import logo
+    return logo.png(size, full=True)  # the phone rounds the corners itself
 
 
 def _file(path):
@@ -684,7 +692,7 @@ def main():
         return  # already running, or no correction has been applied
     try:
         corrections.ensure()  # the correction applied before there was a history: a preset
-        sup = Supervisor(files, tv_app=next(iter(engine._tv_app_files()), None))
+        sup = Supervisor(files, tv_app=engine._tv_app_files())
         icon = None
         if sys.platform == "win32":
             from . import tray

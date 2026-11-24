@@ -65,7 +65,10 @@ def protect_response(cfg, wi, f):
 
 
 class Measurer:
-    def __init__(self, cfg, audio, progress=None, prompt=None):
+    def __init__(self, cfg, audio, progress=None, prompt=None, previous=None):
+        """previous: the test levels the last measurement with this setup found. The level
+        search starts 12 dB below them instead of at START_DB: fewer, no inaudible, bursts."""
+        self.previous = previous or {}
         errors = config.validate(cfg)
         if errors:
             raise RuntimeError(" ".join(errors))
@@ -156,7 +159,12 @@ class Measurer:
             # a subwoofer has its own amplifier: start from the bottom again. Rooms are
             # noisiest in the bass, so it may end up at its limit with less than the others.
             sub = drv.get("sub")
-            level, snr = self._auto_level(drv, self._band(drv), START_DB if sub else start)
+            known = self.previous.get(drv["key"])
+            if known is not None:  # 12 dB below what was needed last time; still rises from there
+                begin = max(START_DB, float(known) - 12)
+            else:
+                begin = START_DB if sub else start
+            level, snr = self._auto_level(drv, self._band(drv), begin)
             if snr < (10 if sub else 15):
                 raise self._silent(drv)
             levels[drv["key"]] = level

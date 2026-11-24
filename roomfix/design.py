@@ -276,10 +276,16 @@ def design(cfg, meas, cal=None, verify_irs=None):
             band = (f > 200) & (f < 2000)
             lags = np.arange(-int(0.01 * fs), int(0.01 * fs) + 1)
             corr = np.exp(2j * np.pi * np.outer(lags, f[band]) / fs) @ (first[band] * np.conj(total[0][band]))
-            if corr[np.argmax(np.abs(corr))].real < 0:
+            peak = corr[np.argmax(np.abs(corr))]
+            agree = peak.real / max(abs(peak), 1e-30)  # +1: same polarity, -1: reversed
+            if agree < -0.5:
                 inverts = [not x for x in inverts]
                 total = [-t for t in total]  # what plays once corrected: for the sum with the subwoofer
                 notes.append(f"{spk['name']} is connected with reversed polarity; this is corrected digitally.")
+            elif agree < 0.5:  # reflections, not the speakers, decide the sign: leave it as wired
+                notes.append(f"Could not tell for sure whether {spk['name']} has the same polarity as "
+                             f"{cfg['speakers'][0]['name']}; it is left as connected. Measure again with the "
+                             "microphone centred between the speakers to be sure.")
         # the same with the changes by hand, for the predicted response
         sa, wa = spk_adj[si], way_adj[si]
         total_m, fine_m = total, fine

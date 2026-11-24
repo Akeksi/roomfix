@@ -1,3 +1,5 @@
+<img src="docs/logo.png" width="96" alt="roomfix logo: a loudspeaker whose response curve ends flat" align="right">
+
 # roomfix
 
 Fully automatic speaker and room correction for Windows. One button measures
@@ -18,9 +20,15 @@ your speakers, computes the correction and applies it to everything you play.
 
 ## Install
 
-1. Download `roomfix.exe` from [Releases](../../releases) and run it. A page
-   opens in your browser.
-   (Or from source: `pip install .` then `roomfix`.)
+1. Download `roomfix-setup-<version>.exe` from [Releases](../../releases) and
+   run it. It installs roomfix for your Windows user (no administrator rights
+   needed) and puts it in the Start menu. Start **roomfix** from there: a page
+   opens in your browser. roomfix itself has no window; it closes by itself half
+   an hour after the page is closed, while the correction keeps running.
+   Uninstall from Windows Settings, Apps. Your settings, measurements and saved
+   corrections stay in `%APPDATA%\roomfix`.
+   (Without installing: `roomfix-<version>-portable.zip`, unpack and run
+   `roomfix.exe`. From source: `pip install .` then `roomfix`.)
 2. Pick a playback engine:
    - **CamillaDSP** (default, required for active crossovers). roomfix
      downloads and runs it for you. Install [VB-CABLE](https://vb-audio.com/Cable/)
@@ -99,42 +107,47 @@ each speaker together with the subwoofer through the running engines.
   through the running engines and warns if subwoofer and speakers do not add
   up as predicted at the crossover.
 
-### TV App source: the TV's own apps, with the subwoofer
+### TV App source: the TV's own apps, through the same speakers
 
-When the TV plays its own apps (streaming, antenna) on its own speakers, the PC
-never sees that sound. If the TV's optical output is connected to the S/PDIF
-input of a sound card on the PC (for example a Sound BlasterX G5), roomfix can
-still add the subwoofer:
+What a TV's own apps play (streaming, antenna) never passes through the PC. The
+TV can still send it out of its optical output: connect that to the S/PDIF
+input of a sound card on the PC, and roomfix plays it through the same
+correction. Say the speakers are active monitors on a USB DAC, with a
+subwoofer: in the TV App source they play the TV's sound exactly as they play
+the PC's, corrected, and lined up with the subwoofer as measured.
 
-1. In Setup, under the subwoofer, choose the **TV's S/PDIF input** and press
-   **Apply correction**. The source switch appears at the top of the page, in
-   the tray icon's menu and on the phone page.
+1. In Setup, under **TV App source**, choose the **TV's S/PDIF input** and the
+   speakers for this source (see below), and press **Apply correction**. The
+   source switch appears at the top of the page, in the tray icon's menu and on
+   the phone page.
 2. On the TV, set the digital (optical) audio output to **PCM**, not Dolby,
-   DTS or "auto"/bitstream, and keep the TV's speakers on.
+   DTS or "auto"/bitstream.
 3. Choose the source **TV App**. roomfix stops the engines that play the PC's
-   sound (so the TV is no longer fed by the PC) and runs one engine that plays
-   only the subwoofer, from left and right of the S/PDIF input. Choose **PC**
-   to go back to the usual chain.
+   sound and starts the same ones, fed from the S/PDIF input. Choose **PC** to
+   go back. The TV's picture does not wait for the sound: if the sound comes
+   late, see whether the TV can delay its picture (AV sync).
 
-In the TV App source the subwoofer gets the measured correction: the speaker
-EQ in the bass, the level and crossover filter, and the polarity. It does not
-get the measured delay, which lines the subwoofer up with the PC's path to the
+**When the speakers are the TV itself** (on HDMI), choose "The TV's own
+speakers" for this source: sending the TV's sound back to the TV would make it
+loop. The TV then plays its apps on its own speakers, and roomfix adds only the
+subwoofer, from left and right of the S/PDIF input, with the measured
+correction: the speaker EQ in the bass, the level and crossover filter, and the
+polarity. Not the measured delay, which lines it up with the PC's path to the
 TV. The TV's speakers play without waiting for roomfix, so the subwoofer can
 only be later than them: its engine runs with small buffers (256-sample chunks)
 to keep that small, and a rate adjuster follows the TV's clock. **The timing
-between the TV's speakers and the subwoofer is not measured in this source.**
-Set it by ear in Setup: an extra subwoofer delay (0 to 50 ms), the polarity
-(try both with a steady bass line; keep the fuller one) and a level for this
-source only. If the bass lags behind the TV's speakers, the TV's own AV sync
-setting may be able to delay its speakers. Changes apply with **Apply
-correction**.
+between the TV's speakers and the subwoofer is not measured then.** Set it by
+ear in Setup: an extra subwoofer delay (0 to 50 ms), the polarity (try both with
+a steady bass line; keep the fuller one) and a level for this source only. If
+the bass lags behind the TV's speakers, the TV's own AV sync setting may be able
+to delay its speakers. Changes apply with **Apply correction**.
 
 Volume, mute and on/off are the same for both sources, and the chosen source is
 remembered across restarts. When nothing has arrived at the S/PDIF input for
 10 seconds, the tray icon turns red and the pages say "no sound from the TV":
 the TV is off or paused, or it sends Dolby instead of PCM. The S/PDIF input is
-followed when Windows renames it ("SPDIF In (2- G5)" to "SPDIF In (3- G5)"),
-like the output devices.
+followed when Windows renames it ("SPDIF In (2- USB Card)" to "SPDIF In (3- USB
+Card)"), like the output devices.
 
 Test signals are played in Windows shared mode, so the bit depth and sample
 rate a device is set to do not matter for measuring. In a noisy room, the
@@ -195,7 +208,8 @@ frequency** (from the data sheet). Then:
   harmless for any driver, one channel at a time, and asks you to confirm
   that each came from the right driver.
 - Levels start very low and rise only until the microphone hears enough,
-  never above the limit set in Setup.
+  never above the limit set in Setup. A later measurement with the same setup
+  starts 12 dB below the levels the one before needed, and rises from there.
 - With CamillaDSP, audio reaches the DAC only through the crossover: if the
   engine is not running, the speakers are silent.
 
@@ -209,7 +223,7 @@ each tweeter is cheap insurance.
 |---|---|
 | Measure | Log sine sweep per driver. A short chirp from one reference driver precedes each sweep, giving exact relative timing without a loopback cable. |
 | Crossover | Linkwitz-Riley 12/24/48 dB/oct. Driver levels are matched; delay and polarity are chosen so the drivers sum in phase at the crossover. |
-| Speakers | Delay and level are set so all speakers arrive together and equally loud. A speaker wired in reverse is detected and fixed. |
+| Speakers | Delay and level are set so all speakers arrive together and equally loud. A speaker wired in reverse is detected and fixed; when reflections make the measurement unclear about it (a microphone far off-centre), the speaker is left as connected and roomfix says so. |
 | Subwoofer | Linkwitz-Riley 24 dB/oct against all speakers. Level matched to the speakers; delay and polarity chosen so that it adds up with them at the crossover. |
 | Two devices | The latency of a CamillaDSP engine is its chunk plus its buffer level; all engines are held at the same level. The remaining difference between the devices is measured through the engines and removed with a delay. |
 | EQ | Up to 20 peaking filters per speaker. Peaks are cut precisely; only broad dips are filled; boost is limited; nothing is corrected outside the speaker's range. |

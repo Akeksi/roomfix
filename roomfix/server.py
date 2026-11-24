@@ -278,7 +278,9 @@ class App:
         try:
             backend = sim.SimAudio(self.cfg, realtime=True) if self.demo else audio.Audio(self.cfg)
             with engine.paused(self.cfg):
-                m = measure.Measurer(self.cfg, backend, self._progress, self._prompt)
+                # the levels the last measurement found with this setup: the search starts near them
+                previous = self.meas.get("levels") if self.meas and self.meas.get("layout") == self.layout() else None
+                m = measure.Measurer(self.cfg, backend, self._progress, self._prompt, previous=previous)
                 multi = len(self.cfg["ways"]) > 1
                 if action == "identify" or (multi and not self.state()["wiring_ok"]):
                     self._span = (0, 0.15 if action != "identify" else 1)
@@ -349,6 +351,9 @@ def make_handler(app):
                 return self._send(200, app.state())
             if path == "/api/design":
                 return self._send(200, design.to_json(app.design) if app.design else None)
+            if path == "/logo.png":  # the browser tab's icon
+                from . import logo
+                return self._send(200, logo.png(64), "image/png")
             file = WEB / ("index.html" if path == "/" else path.lstrip("/"))
             if file.suffix in TYPES and file.is_file() and file.parent == WEB:
                 return self._send(200, file.read_bytes(), TYPES[file.suffix])

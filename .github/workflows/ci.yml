@@ -32,14 +32,25 @@ jobs:
           python-version: "3.12"
       - run: pip install -e .[dev] pyinstaller
       - run: pytest -q
-      - run: pyinstaller --onefile --name roomfix --add-data "roomfix/web;roomfix/web" --collect-all sounddevice --collect-all _sounddevice_data run.py
-      - run: dist\roomfix.exe --version
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Build roomfix.exe and the installer
+        run: python packaging/build.py
+      - name: Check roomfix.exe (demo: page, API, logo, a measurement)
+        run: python packaging/smoke.py dist/roomfix/roomfix.exe
       - uses: actions/upload-artifact@v4
         with:
           name: roomfix-windows
-          path: dist/roomfix.exe
+          path: |
+            dist/roomfix-setup-*.exe
+            dist/roomfix-*-portable.zip
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/roomfix.exe
+          files: |
+            dist/roomfix-setup-*.exe
+            dist/roomfix-*-portable.zip
+          body_path: packaging/release-notes.md

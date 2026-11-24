@@ -10,8 +10,9 @@ import urllib.request
 import numpy as np
 import pytest
 import yaml
+from scipy import signal
 
-from roomfix import config, design, dsp, engine, measure, sim
+from roomfix import config, corrections, design, dsp, engine, measure, sim
 
 FS = 48000
 
@@ -43,6 +44,33 @@ def test_correction_improves_response_and_matches_prediction(two_way):
         sel = (d["freq"] > 30) & (d["freq"] < 18000)
         diff = np.abs(c["verified"] - c["predicted"])[sel]
         assert np.percentile(diff, 95) < 0.5 and diff.max() < 2.0  # max is at deep, noisy nulls
+
+
+def test_polarity_left_as_connected_when_the_measurement_cannot_tell(two_way):
+    """Where reflections rather than the speakers decide the sign (an off-centre microphone),
+    the two speakers' responses are a quarter turn apart: no flip, and a note to measure again."""
+    audio, meas, normal = two_way
+    odd = copy.deepcopy(meas)
+    for wi in range(len(audio.cfg["ways"])):
+        odd["irs"][f"s1w{wi}"] = [np.imag(signal.hilbert(ir)).astype(np.float32) for ir in meas["irs"][f"s0w{wi}"]]
+    d = design.design(audio.cfg, odd)
+    assert [w["invert"] for w in d["speakers"][1]["ways"]] == [w["invert"] for w in normal["speakers"][0]["ways"]]
+    assert any("Could not tell for sure whether Right" in w for w in d["warnings"])
+
+
+def test_next_measurement_starts_near_the_levels_found_before():
+    cfg = config.demo()
+    audio = sim.SimAudio(cfg)
+    plays = lambda: len(audio.history) + len(getattr(audio, "history_other", []))
+    before = plays()
+    levels = measure.Measurer(cfg, audio).find_levels()
+    from_quiet, before = plays() - before, plays()
+    again = measure.Measurer(cfg, audio, previous=levels).find_levels()
+    assert plays() - before < from_quiet  # fewer bursts, none of them inaudibly quiet
+    assert all(abs(again[k] - levels[k]) <= 6 for k in levels)  # and it arrives where it did before
+    # the first burst of each driver is 12 dB under the level found before, never louder
+    quiet = measure.Measurer(cfg, sim.SimAudio(cfg), previous={k: v + 40 for k, v in levels.items()})
+    assert all(v <= d["max_db"] for v, d in zip(quiet.find_levels().values(), quiet.drivers))
 
 
 def test_speakers_time_aligned(two_way):
@@ -79,6 +107,7 @@ def test_crossover_sums_flat_and_detects_reversed_drivers(slope):
     _, _, speaker = run(cfg, flipped=[(1, 0), (1, 1)])
     assert polarity(speaker) == [left, [not left[0], not left[1]]]
     assert any("reversed polarity" in w for w in speaker["warnings"])
+    assert not any("Could not tell" in w for d in (normal, tweeter, speaker) for w in d["warnings"])  # clear cases
     f = normal["freq"]
     xo = (f > 1500) & (f < 3200)
     for d in (normal, tweeter, speaker):  # no cancellation dip around the crossover
@@ -255,12 +284,45 @@ def test_camilladsp_runs_subwoofer_configs_like_the_simulation(with_sub, tmp_pat
         assert np.abs(y[:n] - expected[:n]).max() < 1e-9
 
 
-# ---- TV App: the TV's own speakers, the subwoofer from an S/PDIF input -------------
-SPDIF = "SPDIF In (2–Sound BlasterX G5)"
+# ---- TV App: what the TV's own apps play, from an S/PDIF input -----------------------
+SPDIF = "SPDIF In (2–Sound USB Card)"
 
 
 def tv_cfg(cfg, **tv):
-    return dict(cfg, tv_app=dict(config.DEFAULT["tv_app"], device=SPDIF, **tv))
+    """The TV App source set up; with the TV's own speakers unless speakers= says otherwise."""
+    return dict(cfg, tv_app=dict(config.DEFAULT["tv_app"], device=SPDIF, **{"speakers": "tv", **tv}))
+
+
+def test_tv_app_plays_the_same_speakers_with_the_whole_correction(with_sub, tmp_path, monkeypatch):
+    """Speakers on their own DAC: the PC source's engines, correction and all, take the
+    S/PDIF input instead of the system audio."""
+    audio, _, d = with_sub
+    cfg = tv_cfg(audio.cfg, speakers="roomfix")
+    sub_device = cfg["sub"]["device"] or cfg["output_device"]
+    channels = {cfg["output_device"]: 4, **({sub_device: 2} if cfg["sub"]["device"] else {})}
+    pc, tv = engine.camilladsp_configs(audio.cfg, d, channels), engine.tv_app_configs(cfg, d, channels)
+    assert [device for device, _ in tv] == [device for device, _ in pc]  # every output device
+    x = np.random.default_rng(2).standard_normal((FS // 2, 2)) * 0.1
+    for (_, a), (_, b) in zip(pc, tv):
+        assert b["devices"]["capture"] == {"type": "Wasapi", "channels": 2, "device": SPDIF}
+        assert b["devices"]["playback"] == a["devices"]["playback"]
+        assert b["filters"] == a["filters"] and b["pipeline"] == a["pipeline"]
+        assert np.array_equal(engine.simulate(b, x, FS), engine.simulate(a, x, FS))  # played exactly alike
+    assert config.validate(cfg, n_out=4) == []
+    # no subwoofer is needed then: the speakers play
+    no_sub = tv_cfg(dict(audio.cfg, sub=dict(audio.cfg["sub"], enabled=False)), speakers="roomfix")
+    assert config.tv_app(no_sub) and not config.tv_app(dict(no_sub, tv_app=dict(no_sub["tv_app"], speakers="tv")))
+    bad = tv_cfg(audio.cfg, speakers="both")
+    assert any("speakers" in e for e in config.validate(bad, n_out=4))
+    # Apply writes one engine per output device for this source, and the saved correction keeps them
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "WINDOWS", False)
+    engine.apply(cfg, d)
+    want = ["tvapp.yml", "tvapp_2.yml"] if cfg["sub"]["device"] else ["tvapp.yml"]
+    assert [p.name for p in engine._tv_app_files()] == want
+    assert [p.name for p in corrections.live_files()] == [p.name for p in engine._yamls()] + want
+    engine.apply(tv_cfg(audio.cfg), d)  # the TV's own speakers again: one engine, for the subwoofer
+    assert [p.name for p in engine._tv_app_files()] == ["tvapp.yml"]
 
 
 def test_tv_app_config_plays_only_the_corrected_subwoofer(with_sub):
@@ -269,7 +331,7 @@ def test_tv_app_config_plays_only_the_corrected_subwoofer(with_sub):
     sub_device = cfg["sub"]["device"] or cfg["output_device"]
     channels = {cfg["output_device"]: 4, **({sub_device: 2} if cfg["sub"]["device"] else {})}
     assert engine.camilladsp_configs(cfg, d, channels) == engine.camilladsp_configs(audio.cfg, d, channels)  # PC unchanged
-    device, conf = engine.tv_app_config(cfg, d, channels)
+    [(device, conf)] = engine.tv_app_configs(cfg, d, channels)
     assert device == sub_device
     dev = conf["devices"]
     assert dev["capture"] == {"type": "Wasapi", "channels": 2, "device": SPDIF}  # shared mode: the TV's format
@@ -289,7 +351,7 @@ def test_tv_app_config_plays_only_the_corrected_subwoofer(with_sub):
     assert np.abs(played[:, d["sub"]["channel"]] - want).max() < 1e-9
     assert np.abs(np.delete(played, d["sub"]["channel"], axis=1)).max() == 0
     # set by ear: later, the other polarity, louder or quieter
-    tuned = engine.tv_app_config(tv_cfg(audio.cfg, delay_ms=5.0, invert=True, gain_db=-4.0), d)[1]
+    tuned = engine.tv_app_configs(tv_cfg(audio.cfg, delay_ms=5.0, invert=True, gain_db=-4.0), d)[0][1]
     later = sum(design.render_sub(dict(d, sub=dict(d["sub"], delay=240, invert=not d["sub"]["invert"],
                                                    gains=[g - 4.0 for g in d["sub"]["gains"]])),
                                   si, x[:, spk["input"]], FS) for si, spk in enumerate(d["speakers"]))
@@ -298,10 +360,10 @@ def test_tv_app_config_plays_only_the_corrected_subwoofer(with_sub):
 
 def test_tv_app_needs_a_subwoofer_and_an_input(with_sub):
     audio, _, d = with_sub
-    assert engine.tv_app_config(audio.cfg, d) is None  # no input chosen
+    assert engine.tv_app_configs(audio.cfg, d) == []  # no input chosen
     assert config.tv_app(audio.cfg) is None
-    no_sub = tv_cfg(dict(audio.cfg, sub=dict(audio.cfg["sub"], enabled=False)))
-    assert config.tv_app(no_sub) is None and engine.tv_app_config(no_sub, dict(d, sub=None)) is None
+    no_sub = tv_cfg(dict(audio.cfg, sub=dict(audio.cfg["sub"], enabled=False)))  # the TV's own speakers
+    assert config.tv_app(no_sub) is None and engine.tv_app_configs(no_sub, dict(d, sub=None)) == []
 
 
 def test_camilladsp_runs_the_tv_app_config_like_the_simulation(with_sub, tmp_path):
@@ -309,7 +371,7 @@ def test_camilladsp_runs_the_tv_app_config_like_the_simulation(with_sub, tmp_pat
     if not exe:
         pytest.skip("camilladsp binary not available")
     audio, _, d = with_sub
-    _, c = engine.tv_app_config(tv_cfg(audio.cfg, delay_ms=1.5, invert=True), d)
+    [(_, c)] = engine.tv_app_configs(tv_cfg(audio.cfg, delay_ms=1.5, invert=True), d)
     (tmp_path / "check.yml").write_text(yaml.safe_dump(c, sort_keys=False), encoding="utf-8")
     check = subprocess.run([exe, "--check", str(tmp_path / "check.yml")], capture_output=True, text=True)
     assert check.returncode == 0, check.stdout + check.stderr  # as generated, devices and all
@@ -629,8 +691,12 @@ def test_subwoofer_changed_by_hand_but_the_tv_app_keeps_its_own(with_sub):
     assert np.mean((c["bass"]["sub"] - c0["bass"]["sub"])[deep]) == pytest.approx(-3, abs=0.3)
     fc = cfg["sub"]["crossover"]
     assert np.min((c["predicted"] - c0["predicted"])[(f > fc / 1.3) & (f < fc * 1.3)]) < -3
-    # the TV App source is set by ear on its own: as measured, not as changed for the PC
-    assert engine.tv_app_config(cfg, d) == engine.tv_app_config(tv_cfg(audio.cfg, delay_ms=2.0), measured)
+    # with the TV's own speakers, the TV App source is set by ear on its own: as measured,
+    # not as changed for the PC
+    assert engine.tv_app_configs(cfg, d) == engine.tv_app_configs(tv_cfg(audio.cfg, delay_ms=2.0), measured)
+    # with the same speakers as the PC, it plays exactly what the PC source plays
+    same = dict(cfg, tv_app=dict(cfg["tv_app"], speakers="roomfix"))
+    assert [c["filters"] for _, c in engine.tv_app_configs(same, d)] == [c["filters"] for _, c in engine.camilladsp_configs(cfg, d)]
 
 
 def test_changes_by_hand_are_checked_and_kept(tmp_path, monkeypatch):

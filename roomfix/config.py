@@ -31,12 +31,13 @@ DEFAULT = {
     # otherwise another output device (its different latency is measured and compensated).
     "sub": {"enabled": False, "device": "", "channel": 2, "crossover": 80.0,
             "max_level_db": None},  # None = same test level limit as the speakers
-    # "TV App" source: the TV plays its own apps on its own speakers and sends the sound to a
-    # digital (S/PDIF) input. roomfix then runs only the subwoofer, from that input. device ""
-    # = not used. The TV's speakers play at once, so the subwoofer can only be later: the
-    # measured delay is not used, and delay_ms, invert (against the measured polarity) and
-    # gain_db are set by ear.
-    "tv_app": {"device": "", "delay_ms": 0.0, "invert": False, "gain_db": 0.0},
+    # "TV App" source: what the TV's own apps play, from the TV's digital (S/PDIF) output
+    # into an input of the PC. device "" = not used. speakers "roomfix": the same speakers
+    # and subwoofer as the PC source play it, with the whole correction. speakers "tv": the
+    # speakers are the TV's own, which play at once; roomfix adds only the subwoofer, which
+    # can then only be later: the measured delay is not used, and delay_ms, invert (against
+    # the measured polarity) and gain_db are set by ear.
+    "tv_app": {"device": "", "speakers": "roomfix", "delay_ms": 0.0, "invert": False, "gain_db": 0.0},
     "target": {
         "tilt": -0.8,               # dB per octave
         "bass_boost": 3.0,          # dB shelf below bass_freq
@@ -167,12 +168,14 @@ def sub_device(cfg):
 
 
 TV_APP_MAX_DELAY_MS = 50.0
+TV_APP_SPEAKERS = ("roomfix", "tv")
 
 
 def tv_app(cfg):
-    """The "TV App" settings, or None when that source is not set up (it needs a subwoofer)."""
+    """The "TV App" settings, or None when that source is not set up. With the TV's own
+    speakers it needs a subwoofer: that is all roomfix adds then."""
     t = cfg.get("tv_app") or {}
-    return t if t.get("device") and sub(cfg) else None
+    return t if t.get("device") and (sub(cfg) or t.get("speakers", "roomfix") == "roomfix") else None
 
 
 def wiring_key(cfg):
@@ -216,6 +219,8 @@ def validate(cfg, n_out=None, n_sub=None):
                           "between the two output devices.")
     t = tv_app(cfg)
     if t:
+        if t.get("speakers") not in TV_APP_SPEAKERS:
+            errors.append('TV App speakers must be "roomfix" (the speakers above) or "tv" (the TV\'s own).')
         if t["device"] == cfg["capture_device"]:
             errors.append("The TV App input must be the S/PDIF input the TV is connected to, "
                           "not the system audio source.")

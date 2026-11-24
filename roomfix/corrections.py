@@ -25,7 +25,7 @@ from pathlib import Path
 from . import config
 
 HISTORY = 20
-ENGINE_FILES = {"camilladsp": ("camilladsp*.yml", "tvapp.yml"), "equalizerapo": ("equalizerapo.txt",)}
+ENGINE_FILES = {"camilladsp": ("camilladsp*.yml", "tvapp*.yml"), "equalizerapo": ("equalizerapo.txt",)}
 SETTINGS = ("target", "crossover", "adjust")  # the parts of the settings a correction keeps
 NAME_MAX = 60
 
@@ -66,7 +66,7 @@ def settings_of(cfg):
     kept = {key: cfg.get(key) for key in SETTINGS}
     kept["sub_crossover"] = (cfg.get("sub") or {}).get("crossover")
     tv = cfg.get("tv_app") or {}
-    kept["tv_app"] = {k: tv.get(k) for k in ("delay_ms", "invert", "gain_db")}
+    kept["tv_app"] = {k: tv.get(k) for k in ("speakers", "delay_ms", "invert", "gain_db")}
     return json.loads(json.dumps(kept))
 
 

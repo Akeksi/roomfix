@@ -52,15 +52,16 @@ def _picture(state, size):
     """A loudspeaker as RGBA [size, size, 4]: sound waves when on, a cross when not."""
     n = size * 4  # drawn larger and averaged down, for smooth edges
     y, x = (np.mgrid[0:n, 0:n] + 0.5) / n
-    cone = (x > 0.26) & (x < 0.52) & (np.abs(y - 0.5) < 0.15 + (x - 0.26) * 0.85)
-    shape = ((x > 0.06) & (x <= 0.26) & (np.abs(y - 0.5) < 0.15)) | cone
+    dy = np.abs(y - 0.5)
+    # as large as the notification area's own icons: the cone fills the height
+    shape = ((x > 0.03) & (x <= 0.24) & (dy < 0.17)) | ((x > 0.22) & (x < 0.50) & (dy < 0.17 + (x - 0.22) * 1.15))
     if state in ("on", "waiting"):
-        r = np.hypot(x - 0.50, y - 0.5)
-        beam = (x > 0.56) & (np.abs(y - 0.5) < (x - 0.48) * 1.1)
-        shape |= beam & ((np.abs(r - 0.22) < 0.045) | (np.abs(r - 0.40) < 0.045))
+        r = np.hypot(x - 0.47, y - 0.5)
+        beam = (x > 0.55) & (dy < (x - 0.45) * 1.5)
+        shape |= beam & ((np.abs(r - 0.21) < 0.055) | (np.abs(r - 0.39) < 0.055))
     else:
-        u, v = x - 0.78, y - 0.5
-        shape |= (np.abs(u) < 0.17) & (np.abs(v) < 0.17) & ((np.abs(u - v) < 0.06) | (np.abs(u + v) < 0.06))
+        u, v = x - 0.77, y - 0.5
+        shape |= (np.abs(u) < 0.19) & (np.abs(v) < 0.19) & ((np.abs(u - v) < 0.075) | (np.abs(u + v) < 0.075))
     alpha = shape.reshape(size, 4, size, 4).mean(axis=(1, 3))
     img = np.zeros((size, size, 4), np.uint8)
     img[..., :3] = COLORS[state]
@@ -74,20 +75,6 @@ def _png(img):
     rows = b"".join(b"\0" + row.tobytes() for row in img)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", img.shape[1], img.shape[0], 8, 6, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
-
-
-def app_icon(size):
-    """PNG of the phone page's home-screen icon: the loudspeaker on a dark tile. It stays
-    inside the middle of the tile, which a phone keeps when it rounds the icon off."""
-    inner = int(size * 0.64)
-    picture = _picture("on", inner).astype(float)
-    tile = np.zeros((size, size, 4))
-    tile[...] = (17, 19, 21, 255)
-    at = (size - inner) // 2
-    part = tile[at:at + inner, at:at + inner]
-    alpha = picture[..., 3:] / 255
-    part[..., :3] = picture[..., :3] * alpha + part[..., :3] * (1 - alpha)
-    return _png(np.round(tile).astype(np.uint8))
 
 
 def icon_file(state, sizes=(16, 20, 24, 32, 48)):
@@ -106,7 +93,7 @@ WM_LBUTTONUP, WM_RBUTTONUP, WM_APP = 0x202, 0x205, 0x8000
 WM_ICON, WM_OSD = WM_APP + 1, WM_APP + 2
 KEYS = {1: (0, 0xAF, 1.0), 2: (0, 0xAE, -1.0), 3: (0, 0xAD, None),  # id: (modifier, key, steps)
         4: (4, 0xAF, 0.5), 5: (4, 0xAE, -0.5)}                      # 4 = Shift
-SOURCE_ITEMS = {"pc": "PC: what Windows plays", "tv_app": "TV App: what the TV plays (subwoofer only)"}
+SOURCE_ITEMS = {"pc": "PC: what Windows plays", "tv_app": "TV App: what the TV's own apps play"}
 MF_STRING, MF_GRAYED, MF_CHECKED, MF_POPUP, MF_SEPARATOR = 0, 1, 8, 0x10, 0x800
 
 
@@ -172,6 +159,10 @@ def _win32():
     sig(u, "FillRect", ctypes.c_int, w.HDC, P(w.RECT), w.HBRUSH)
     sig(u, "DrawTextW", ctypes.c_int, w.HDC, w.LPCWSTR, ctypes.c_int, P(w.RECT), w.UINT)
     sig(u, "GetDpiForSystem", w.UINT)
+    try:  # Windows 10 1703 and later
+        sig(u, "SetProcessDpiAwarenessContext", w.BOOL, w.HANDLE)
+    except AttributeError:
+        pass
     sig(g, "CreateSolidBrush", w.HBRUSH, w.DWORD)
     sig(g, "DeleteObject", w.BOOL, w.HANDLE)
     sig(g, "SelectObject", w.HANDLE, w.HDC, w.HANDLE)
@@ -180,6 +171,21 @@ def _win32():
     sig(g, "CreateFontW", w.HANDLE, *([ctypes.c_int] * 5), *([w.DWORD] * 8), w.LPCWSTR)
     sig(s, "Shell_NotifyIconW", w.BOOL, w.DWORD, P(IconData))
     return u, s, g, k, w, proc, WndClass, IconData, Paint
+
+
+def _sharp(u):
+    """Draw in the screen's own pixels. Python does not say that it can, so on a scaled
+    screen (150 %, 250 %) Windows would draw the icon and the volume display at 100 % and
+    enlarge them: blurred. Before the process makes its first window."""
+    try:
+        if u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-2)):  # system aware
+            return
+    except AttributeError:
+        pass
+    try:
+        u.SetProcessDPIAware()  # older Windows
+    except AttributeError:
+        pass
 
 
 class Tray:
@@ -219,6 +225,7 @@ class Tray:
     def _run(self):
         (self.u, self.s, self.g, k, w, proc, WndClass, self.IconData, self.Paint) = _win32()
         u, self.w = self.u, w
+        _sharp(u)
         self.instance = k.GetModuleHandleW(None)
         self.proc = proc(self._message)  # keep a reference: Windows calls it
         for name in ("roomfix-tray", "roomfix-osd"):
@@ -295,9 +302,9 @@ class Tray:
         if (state, text) == self.shown and not add:
             return
         if state not in self.icons:
+            size = self.u.GetSystemMetrics(49)  # small icon, in pixels of this screen (40 at 250 %)
             path = config.data_dir() / f"icon_{state}.ico"
-            path.write_bytes(icon_file(state))
-            size = self.u.GetSystemMetrics(49)  # small icon, in pixels of this screen
+            path.write_bytes(icon_file(state, sizes=(size,)))  # drawn at that size, not enlarged
             self.icons[state] = self.u.LoadImageW(None, str(path), 1, size, size, 0x10)
         data = self._data()
         data.flags, data.message, data.icon, data.tip = 1 | 2 | 4, WM_ICON, self.icons[state], text[:127]

@@ -136,6 +136,31 @@ def test_tv_app_source_runs_only_the_subwoofer(tmp_path, monkeypatch):
     assert world.running() == ["USB DAC"]
 
 
+def test_tv_app_source_plays_the_same_speakers_from_the_tv(tmp_path, monkeypatch):
+    """Speakers on their own DAC: the TV App source runs an engine on every output device,
+    all of them taking the S/PDIF input; one of them says whether sound arrives."""
+    world, sup = setup(tmp_path, monkeypatch)
+    paths = []
+    for name, out in (("tvapp.yml", "LG TV (HDMI)"), ("tvapp_2.yml", "USB DAC")):
+        paths.append(tmp_path / name)
+        paths[-1].write_text(yaml.safe_dump({"devices": {"capture": {"type": "Wasapi", "device": SPDIF},
+                                                         "playback": {"type": "Wasapi", "device": out}}}))
+    world.inputs = ["CABLE Output (VB-Audio Virtual Cable)", SPDIF]
+    sup = supervisor.Supervisor(sup.files, spawn=world.spawn, ask=world.ask, outputs=lambda: world.outputs,
+                                inputs=lambda: world.inputs, clock=lambda: world.now, tv_app=paths)
+    world.run(sup, 3)
+    assert world.running() == ["LG TV (HDMI)", "USB DAC"]
+    sup.set_source("tv_app")
+    world.run(sup, 3)
+    assert world.running() == ["LG TV (HDMI)", "USB DAC"] and world.clashes == []
+    assert [s[0] for s in world.spawned[-2:]] == ["tvapp.yml", "tvapp_2.yml"]
+    assert [e.listen for e in sup.engines] == [True, False]
+    # a reload with the same files keeps them running; the TV's own speakers instead (one
+    # engine) start the group anew
+    assert sup.reload(sup.files, paths)["source"] == "tv_app"
+    assert sup.reload(sup.files, paths[:1])["source"] == "tv_app" and len(sup.engines) == 1
+
+
 def test_source_survives_a_restart_and_falls_back_to_pc(tmp_path, monkeypatch):
     world, sup = setup_tv(tmp_path, monkeypatch)
     sup.set_source("tv_app")
@@ -304,9 +329,13 @@ def test_tray_icon_tells_the_state(tmp_path, monkeypatch):
         ico = tray.icon_file(state)
         assert ico[:4] == bytes([0, 0, 1, 0]) and ico[4] >= 3 and b"PNG" in ico
     assert tray.icon_file("on") != tray.icon_file("muted")
-    for size in (192, 512):  # and the phone page has one for the home screen
-        png = tray.app_icon(size)
+    from roomfix import logo
+    for size in (192, 512):  # and the phone page has one for the home screen: the logo
+        png = logo.png(size, full=True)
         assert png[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", png[16:24]) == (size, size)
+    ico = logo.ico()  # roomfix.exe's icon, from 16 to 256 pixels
+    assert ico[:4] == bytes([0, 0, 1, 0]) and struct.unpack("<H", ico[4:6])[0] == len(logo.ICO_SIZES)
+    assert ico[6 + 16 * (len(logo.ICO_SIZES) - 1)] == 0  # (256 is written as 0)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the notification area is a Windows thing")

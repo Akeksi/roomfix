@@ -109,19 +109,42 @@ TV_APP_CHUNK = 256  # small: the TV's own speakers do not wait for the subwoofer
 TV_APP_LEVEL = 512  # playback buffer. Shared-mode capture arrives in 10 ms packets, which it must bridge.
 
 
-def tv_app_config(cfg, design, channels=None):
-    """The engine of the "TV App" source as (output device, dict), or None if it is not set up.
+def tv_app_configs(cfg, design, channels=None):
+    """The engines of the "TV App" source as [(output device, dict)]; [] if it is not set up.
 
-    The TV plays its own apps on its own speakers and sends the sound to an S/PDIF input.
-    Only the subwoofer plays, with the measured correction (speaker EQ in the bass, level,
-    crossover, polarity) from left and right of that input. Not the measured delay: it lines
-    the subwoofer up with the PC's path to the TV. The TV's speakers do not wait for this
-    engine, so the subwoofer is as early as it can be, plus the delay set by ear.
+    The TV sends what its own apps play to an S/PDIF input of the PC.
+
+    speakers "roomfix": the engines of the PC source, the whole correction included, take
+    that input instead of the system audio. The same speakers and subwoofer play, lined up
+    as measured.
+
+    speakers "tv": the speakers are the TV's own, which play the apps by themselves. Only the
+    subwoofer plays, with the measured correction (speaker EQ in the bass, level, crossover,
+    polarity) from left and right of that input. Not the measured delay: it lines the
+    subwoofer up with the PC's path to the TV. The TV's speakers do not wait for this engine,
+    so the subwoofer is as early as it can be, plus the delay set by ear.
     """
+    t = config.tv_app(cfg)
+    if not t:
+        return []
+    if t.get("speakers", "roomfix") == "roomfix":
+        result = []
+        for device, conf in camilladsp_configs(cfg, design, channels):
+            n_in = max(2, conf["devices"]["capture"]["channels"])  # S/PDIF is stereo
+            conf["mixers"]["speakers"]["channels"]["in"] = n_in
+            conf["devices"]["capture"] = {"type": "Wasapi", "channels": n_in, "device": t["device"]}
+            result.append((device, dict(conf, title="roomfix TV App")))
+        return result
+    tv = _tv_sub_config(cfg, design, t, channels)
+    return [tv] if tv else []
+
+
+def _tv_sub_config(cfg, design, t, channels):
+    """The subwoofer's engine for the TV's own speakers, or None without a subwoofer."""
     # as measured: the changes by hand are for the PC's path, this source has its own by ear
     design = dict(design, **(design.get("auto") or {}))
-    t, sub = config.tv_app(cfg), design.get("sub")
-    if not t or not sub:
+    sub = design.get("sub")
+    if not sub:
         return None
     channels, fs = channels or {}, design["fs"]
     device = sub["device"] or cfg["output_device"]
@@ -260,8 +283,9 @@ def _download():
         _exe().write_bytes(archive.read("camilladsp.exe"))
 
 
-def _own_processes(access=0x1000):
-    """Open handles of the CamillaDSP processes started from roomfix's own copy.
+def _own_processes(access=0x1000, program=None):
+    """Open handles of the CamillaDSP processes started from roomfix's own copy (or, with
+    program, of the processes of that program, this one excepted).
 
     Other CamillaDSP installations on the computer are never touched. The caller
     closes the handles. access: PROCESS_QUERY_LIMITED_INFORMATION by default.
@@ -278,9 +302,11 @@ def _own_processes(access=0x1000):
     used = wintypes.DWORD()
     if not k32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(used)):
         return k32, []
-    own = os.path.normcase(os.path.realpath(_exe()))
+    own = os.path.normcase(os.path.realpath(program or _exe()))
     handles = []
     for pid in pids[:used.value // ctypes.sizeof(wintypes.DWORD)]:
+        if pid == os.getpid():
+            continue
         handle = k32.OpenProcess(access | 0x1000, False, pid)
         if not handle:
             continue
@@ -317,18 +343,80 @@ def camilla_stop():
         time.sleep(0.5)  # let Windows release the audio device
 
 
+def quit_all():
+    """Close every roomfix: the background process and its engines and, for roomfix.exe, the
+    pages that run from it too. The installer does this before it replaces the program.
+    Returns whether the correction was running (to start it again afterwards)."""
+    from . import supervisor
+    if not (WINDOWS and getattr(sys, "frozen", False)):
+        running = supervisor.request("/api/status") is not None
+        camilla_stop()
+        return running
+    # roomfix.exe: only what runs from this very program. A roomfix that runs from elsewhere
+    # (another copy, or from Python) is not this one's to stop, nor its engines.
+    me = os.path.normcase(os.path.realpath(sys.executable))
+    ours = _program_of(supervisor._info().get("pid")) == me
+    if ours:
+        camilla_stop()
+    k32, handles = _own_processes(0x0001 | 0x00100000, program=sys.executable)
+    for handle in handles:  # the pages
+        k32.TerminateProcess(handle, 0)
+        k32.WaitForSingleObject(handle, 5000)
+        k32.CloseHandle(handle)
+    return ours
+
+
+def _program_of(pid):
+    """The program file a process runs (normalised), or None."""
+    import ctypes
+    from ctypes import wintypes
+    if not pid:
+        return None
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                               ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return None
+    try:
+        buf, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return os.path.normcase(os.path.realpath(buf.value))
+        return None
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _startup_text():
+    from . import supervisor
+    line = " ".join(f'""{arg}""' for arg in supervisor.command())
+    return f'CreateObject("WScript.Shell").Run "{line}", 0, False\n'
+
+
+def startup_here():
+    """The correction starts with Windows (a Startup entry exists): from this roomfix. For
+    roomfix.exe installed where roomfix ran from Python before, or moved."""
+    path = _startup_file()
+    if WINDOWS and path.exists() and path.read_text(encoding="utf-8", errors="replace") != _startup_text():
+        path.write_text(_startup_text(), encoding="utf-8")
+
+
 def _yamls():
     """Configuration files of the correction, one per output device."""
     return sorted(config.data_dir().glob("camilladsp*.yml"))
 
 
-def _tv_app_yaml():
-    """Configuration file of the "TV App" source's engine. It exists if that source is set up."""
-    return config.data_dir() / "tvapp.yml"
+def _tv_app_yaml(i=0):
+    """Configuration file of the "TV App" source's engine for the i-th output device."""
+    return config.data_dir() / ("tvapp.yml" if i == 0 else f"tvapp_{i + 1}.yml")
 
 
 def _tv_app_files():
-    return [_tv_app_yaml()] if _tv_app_yaml().exists() else []
+    """The TV App source's configuration files; they exist if that source is set up."""
+    return sorted(config.data_dir().glob("tvapp*.yml"))
 
 
 def _check(files):
@@ -362,7 +450,7 @@ def _started(status):
         hint = "" if "not connected" in why else (" Check that the output devices and the system audio source "
                                                   "are all set to the same sample rate in Windows sound settings.")
         raise RuntimeError(f"CamillaDSP could not start: {why}.{hint} roomfix keeps trying.")
-    active = "Correction is active (CamillaDSP" + (", source TV App: only the subwoofer plays)" if tv else ")")
+    active = "Correction is active (CamillaDSP" + (", source TV App)" if tv else ")")
     if waiting:
         return active + ", but waiting for a device: " + "; ".join(waiting) + "."
     if any(e.get("signal") is False for e in status["engines"]):
@@ -471,9 +559,8 @@ def engine_files(cfg, design, channels=None):
     for i, (_, conf) in enumerate(camilladsp_configs(cfg, design, channels)):
         path = _yaml() if i == 0 else _yaml().with_name(f"camilladsp_{i + 1}.yml")
         files[path] = yaml.safe_dump(conf, sort_keys=False)
-    tv = tv_app_config(cfg, design, channels)
-    if tv:
-        files[_tv_app_yaml()] = yaml.safe_dump(tv[1], sort_keys=False)
+    for i, (_, conf) in enumerate(tv_app_configs(cfg, design, channels)):
+        files[_tv_app_yaml(i)] = yaml.safe_dump(conf, sort_keys=False)
     return files
 
 
@@ -526,8 +613,7 @@ def switch_to_files(cfg):
         return f"Demo: CamillaDSP config written to {_yaml()}"
     from . import supervisor
     if cfg["autostart"]:
-        line = " ".join(f'""{arg}""' for arg in supervisor.command())
-        _startup_file().write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
+        _startup_file().write_text(_startup_text(), encoding="utf-8")
     elif _startup_file().exists():
         _startup_file().unlink()
     status = supervisor.reload()

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>roomfix</title>
+<link rel="icon" type="image/png" href="logo.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,7 +14,7 @@
     <button id="mute" type="button">Mute</button>
     <input id="volume" type="range" min="-60" max="0" step="0.5" aria-label="Volume">
     <output id="volume-db"></output>
-    <select id="source" aria-label="Source" hidden title="PC: what Windows plays, through the correction, on every output device. TV App: what the TV's own apps play; the TV's speakers play it, and roomfix adds the subwoofer from the S/PDIF input."></select>
+    <select id="source" aria-label="Source" hidden title="PC: what Windows plays, through the correction, on every output device. TV App: what the TV's own apps play, from the S/PDIF input (see Setup)."></select>
   </span>
   <span id="demo" class="chip" hidden>Demo: simulated speakers</span>
   <span id="engine" class="chip"></span>
@@ -58,20 +59,22 @@
     <p id="sub-note" class="muted" hidden>The subwoofer is on its own output device. roomfix measures the delay between
       the two devices through the playback engine and compensates it. Leave the Windows volume of both devices and the
       volume of the amplifiers as they are after measuring; use the volume keys of the keyboard, or the slider at the top of this page, to listen louder or quieter.</p>
-    <div class="sub-opt">
-      <h3>TV App source</h3>
-      <p class="muted">For a TV that plays its own apps on its own speakers and sends the sound over an optical
-        (S/PDIF) cable to a sound card. With the source "TV App" (top of this page, tray icon or phone), roomfix
-        plays only the subwoofer, from that input, with the measured correction. Set the TV's digital audio output
-        to PCM. The timing between the TV's speakers and the subwoofer is not measured in this source: set it by
-        ear below. Press Apply correction to use changes.</p>
-      <div class="grid">
-        <label data-help="The sound card input the TV's optical output is connected to, for example &quot;SPDIF In&quot;. Not the virtual cable. Not used: no TV App source.">TV's S/PDIF input<select id="tv_device"></select></label>
-        <label class="tv-opt" data-help="The TV's speakers do not wait for the subwoofer, so roomfix can only make the subwoofer later. Add delay if the bass seems to come before the TV's speakers. If it comes after them, see whether the TV can delay its own speakers (AV sync).">Extra subwoofer delay (ms)<input id="tv_delay" type="number" min="0" max="50" step="0.5"></label>
-        <label class="tv-opt" data-help="The subwoofer's level against the TV's speakers, in this source only. The volume (keys, slider) stays the same for both sources.">Subwoofer level (dB)<input id="tv_gain" type="number" min="-20" max="10" step="0.5"></label>
-        <label class="check tv-opt" data-help="Turns the subwoofer's polarity around against the measured one. Try both with music that has a steady bass line: keep the one with fuller bass at the listening position."><input id="tv_invert" type="checkbox"> Invert subwoofer polarity</label>
-      </div>
+    <h3>TV App source</h3>
+    <p class="muted">For what a TV's own apps play (streaming, antenna), which never passes through the PC. Connect the
+      TV's optical output to the S/PDIF input of a sound card and set the TV's digital audio output to PCM. With the
+      source "TV App" (top of this page, tray icon or phone), roomfix plays it from that input. Press Apply
+      correction to use changes.</p>
+    <div class="grid">
+      <label data-help="The sound card input the TV's optical output is connected to, for example &quot;SPDIF In&quot;. Not the virtual cable. Not used: no TV App source.">TV's S/PDIF input<select id="tv_device"></select></label>
+      <label class="tv-opt" data-help="The speakers above: they play the TV's sound with the whole correction, exactly as they play the PC's, subwoofer included. For speakers on their own DAC or amplifier. The TV's own speakers: when the speakers above are the TV itself (on HDMI), the TV plays its apps by itself, and roomfix adds only the subwoofer. Sending the TV's sound back to the TV would make it loop.">Speakers in this source<select id="tv_speakers">
+        <option value="roomfix">The speakers above, with the correction</option>
+        <option value="tv">The TV's own speakers: roomfix adds the subwoofer</option></select></label>
+      <label class="tv-opt tv-own" data-help="The TV's speakers do not wait for the subwoofer, so roomfix can only make the subwoofer later. Add delay if the bass seems to come before the TV's speakers. If it comes after them, see whether the TV can delay its own speakers (AV sync).">Extra subwoofer delay (ms)<input id="tv_delay" type="number" min="0" max="50" step="0.5"></label>
+      <label class="tv-opt tv-own" data-help="The subwoofer's level against the TV's speakers, in this source only. The volume (keys, slider) stays the same for both sources.">Subwoofer level (dB)<input id="tv_gain" type="number" min="-20" max="10" step="0.5"></label>
+      <label class="check tv-opt tv-own" data-help="Turns the subwoofer's polarity around against the measured one. Try both with music that has a steady bass line: keep the one with fuller bass at the listening position."><input id="tv_invert" type="checkbox"> Invert subwoofer polarity</label>
     </div>
+    <p id="tv-own-note" class="muted" hidden>The timing between the TV's speakers and the subwoofer cannot be measured
+      in this source: set it by ear above.</p>
     <ul id="errors" class="errors"></ul>
   </details>
 

@@ -40,14 +40,25 @@ def main():
                         help="run the applied correction in the background: keeps the playback engines running "
                              "(roomfix starts this itself when you apply a correction, and at login)")
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--quit", action="store_true",
+                        help="close roomfix: the correction in the background and any page that runs")
     parser.add_argument("--from-tray", action="store_true", help=argparse.SUPPRESS)  # no window, see IDLE_S
     args = parser.parse_args()
+    frozen = getattr(sys, "frozen", False)  # roomfix.exe
+    if args.quit:
+        from . import engine
+        sys.exit(0 if engine.quit_all() else 3)  # 3: nothing was running
+    if frozen and not args.demo:
+        from . import engine
+        engine.startup_here()  # installed where roomfix ran from Python before
     if args.engine:
         from . import supervisor
         return supervisor.main()
     if args.demo:
         os.environ.setdefault("ROOMFIX_HOME", tempfile.mkdtemp(prefix="roomfix-demo-"))
-    if args.from_tray:
+    # roomfix.exe started from the Start menu has no window either: like the tray's page
+    windowless = args.from_tray or sys.stdout is None
+    if windowless:
         _log_to_file()
 
     from .server import App, open_server
@@ -64,10 +75,10 @@ def main():
         if not args.no_browser:
             webbrowser.open(url)
         return
-    print(f"{kind} {__version__} is running at {url}" + ("" if args.from_tray else "  (Ctrl+C to quit)"))
+    print(f"{kind} {__version__} is running at {url}" + ("" if windowless else "  (Ctrl+C to quit)"))
     if not args.no_browser:
         webbrowser.open(url)
-    if args.from_tray:
+    if windowless:
         threading.Thread(target=_close_when_idle, args=(server, app), daemon=True).start()
     try:
         server.serve_forever()

@@ -77,7 +77,10 @@ function renderSetup() {
   const tv = cfg.tv_app;
   options($("#tv_device"), [["", "Not used"], ...ins.filter((d) => ![cfg.capture_device, cfg.input_device].includes(d.name))
     .map((d) => [d.name, d.name])], tv.device);
-  for (const e of document.querySelectorAll(".tv-opt")) e.hidden = !tv.device;
+  const own = tv.speakers === "tv";  // the TV's own speakers: roomfix adds only the subwoofer
+  for (const e of document.querySelectorAll(".tv-opt")) e.hidden = !tv.device || (e.classList.contains("tv-own") && !own);
+  $("#tv-own-note").hidden = !tv.device || !own;
+  $("#tv_speakers").value = tv.speakers || "roomfix";
   $("#tv_delay").value = tv.delay_ms;
   $("#tv_gain").value = tv.gain_db;
   $("#tv_invert").checked = tv.invert;
@@ -179,6 +182,7 @@ function bindSetup() {
   $("#sub_crossover").onchange = (e) => { cfg.sub.crossover = +e.target.value; save(); };
   $("#sub_max").onchange = (e) => { cfg.sub.max_level_db = e.target.value === "" ? null : +e.target.value; save(); };
   $("#tv_device").onchange = (e) => { cfg.tv_app.device = e.target.value; save(true); };
+  $("#tv_speakers").onchange = (e) => { cfg.tv_app.speakers = e.target.value; save(true); };
   $("#tv_delay").onchange = (e) => { cfg.tv_app.delay_ms = +e.target.value || 0; save(); };
   $("#tv_gain").onchange = (e) => { cfg.tv_app.gain_db = +e.target.value || 0; save(); };
   $("#tv_invert").onchange = (e) => { cfg.tv_app.invert = e.target.checked; save(); };
@@ -481,7 +485,7 @@ function update(state) {
   $("#setup-summary").textContent = S.errors.length ? "needs attention"
     : `${S.cfg.speakers.length} × ${S.cfg.ways.length}-way on ${S.cfg.output_device}`
       + (S.cfg.sub.enabled ? ` + subwoofer${S.cfg.sub.device ? " on " + S.cfg.sub.device : ""}` : "")
-      + (S.cfg.sub.enabled && S.cfg.tv_app.device ? `; TV App from ${S.cfg.tv_app.device}` : "");
+      + (S.cfg.tv_app.device && (S.cfg.sub.enabled || S.cfg.tv_app.speakers !== "tv") ? `; TV App from ${S.cfg.tv_app.device}` : "");
   for (const id of ["run", "identify", "apply", "verify"]) $("#" + id).disabled = busy || S.errors.length > 0;
   $("#cancel").hidden = !busy;
   $("#job").hidden = !busy;
