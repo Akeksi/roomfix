@@ -1,13 +1,26 @@
-The first release of roomfix as a Windows program: install it, start it from the Start menu.
+roomfix as a Windows program: install it, start it from the Start menu.
 
-**Download `roomfix-setup-0.2.1.exe`** and run it. It installs roomfix for your Windows user
+**Download `roomfix-setup-0.2.2.exe`** and run it. It installs roomfix for your Windows user
 (no administrator rights needed) with a Start menu entry. roomfix opens its page in your
 browser. Windows may warn that the installer is from an unknown publisher (it is not code
 signed): choose "More info", then "Run anyway". Without installing:
-`roomfix-0.2.1-portable.zip`, unpack it and run `roomfix.exe`.
+`roomfix-0.2.2-portable.zip`, unpack it and run `roomfix.exe`.
+
+**Updating from 0.2.1:** run the new installer. It stops roomfix, replaces it and starts the
+correction again; your measurements and saved corrections stay as they are.
 
 You also need [VB-CABLE](https://vb-audio.com/Cable/) (for the CamillaDSP engine) and a
 measurement microphone. See the README for the setup.
+
+## New in this version
+
+- **No more short dropouts.** The background process restarted an engine as soon as it missed
+  a single answer from it, which can happen on a busy computer or when a security program
+  resets a local connection. Each restart cut the sound for a moment, every half hour to
+  three hours. Now an engine is restarted only when it has not answered for 10 seconds and
+  three questions in a row.
+- An engine whose control port is taken by another program gets a new port, instead of
+  being started again on the same port.
 
 ## What it does
 
@@ -25,11 +38,3 @@ measurement microphone. See the README for the setup.
 - **TV App source**: what the TV's own apps play, from its optical output, through the same
   speakers and correction; or, when the speakers are the TV's own, roomfix adds the
   subwoofer.
-
-## New in this version
-
-- roomfix.exe and an installer, with the roomfix logo; no console window.
-- A sharp notification-area icon on scaled screens (150 %, 250 %).
-- The TV App source plays the same speakers as the PC source, with the whole correction.
-- A new measurement starts near the test levels of the one before: no long quiet start.
-- Speaker polarity is only flipped when the measurement is clear about it.
