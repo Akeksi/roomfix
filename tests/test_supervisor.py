@@ -4,6 +4,8 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -485,6 +487,56 @@ def test_http_api_and_shutdown(tmp_path, monkeypatch):
     assert not thread.is_alive() and not (tmp_path / "engine.json").exists()
     assert all(p.code is not None for p in world.by_port.values())  # the engines were stopped too
     assert supervisor.request("/api/status") is None
+
+
+def test_stop_waits_until_the_supervisor_has_closed(tmp_path, monkeypatch):
+    """engine.json goes first; the supervisor still closes its API and its tray icon. The
+    installer ends every roomfix.exe right after stopping it: not one halfway through."""
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    info = tmp_path / "engine.json"
+    waited = []
+    monkeypatch.setattr(engine, "wait_exit", lambda pid, timeout: waited.append(pid) or True)
+
+    def quits(path, body=None, timeout=1.5):
+        assert path == "/api/quit"
+        info.unlink()
+        return {"ok": True}
+
+    monkeypatch.setattr(supervisor, "request", quits)
+    for pid in (4242, os.getpid()):  # (one in this very process is a test's thread)
+        info.write_text(json.dumps({"port": 1, "pid": pid, "started": time.time()}))
+        supervisor.stop()
+    assert waited == [4242]
+    # one that does not answer is dismissed as before, without waiting for its process
+    monkeypatch.setattr(supervisor, "request", lambda *args, **kwargs: None)
+    info.write_text(json.dumps({"port": 1, "pid": 4243, "started": time.time()}))
+    supervisor.stop(timeout=0.2)
+    assert waited == [4242] and not info.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="waits for a Windows process")
+def test_stop_returns_once_the_supervisor_process_has_ended(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOMFIX_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "WINDOWS", True)  # (a demo App earlier in the run switched it off)
+    info = tmp_path / "engine.json"
+    # a stand-in supervisor: removes engine.json, then takes a second to close
+    script = ("import pathlib, sys, time\n"
+              "time.sleep(0.3)\n"
+              "for _ in range(50):\n"
+              "    try:\n"
+              "        pathlib.Path(sys.argv[1]).unlink(); break\n"
+              "    except PermissionError:\n"
+              "        time.sleep(0.02)\n"
+              "time.sleep(1.0)\n")
+    child = subprocess.Popen([sys.executable, "-c", script, str(info)])
+    try:
+        info.write_text(json.dumps({"port": 1, "pid": child.pid, "started": time.time()}))
+        monkeypatch.setattr(supervisor, "request", lambda *args, **kwargs: {"ok": True})
+        supervisor.stop()
+        assert child.poll() == 0 and not info.exists()
+    finally:
+        child.kill()
+        child.wait()
 
 
 PHONE_HOST = "living-room-pc.tail1234.ts.net"  # what `tailscale serve` passes on from the phone

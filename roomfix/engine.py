@@ -390,6 +390,27 @@ def _program_of(pid):
         k32.CloseHandle(handle)
 
 
+def wait_exit(pid, timeout):
+    """Wait until process pid has ended, at most timeout seconds. Returns whether it has."""
+    if not WINDOWS:
+        return True
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+    if not handle:
+        return True  # it has ended already
+    try:
+        return k32.WaitForSingleObject(handle, int(max(0.0, timeout) * 1000)) == 0
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _startup_text():
     from . import supervisor
     line = " ".join(f'""{arg}""' for arg in supervisor.command())

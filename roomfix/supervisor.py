@@ -809,14 +809,20 @@ def reload():
     return wait_ready(status=status)
 
 
-def stop(timeout=8.0):
-    """Stop the supervisor and, with it, the engines."""
-    if not _info():
+def stop(timeout=8.0, closing=5.0):
+    """Stop the supervisor and, with it, the engines. Returns once its process has ended
+    (or after `closing` more seconds): it removes engine.json first, then closes its API and
+    its tray icon. Whoever stops it may end every roomfix.exe next (the installer does), and
+    one ended halfway would leave its icon behind in the notification area."""
+    info = _info()
+    if not info:
         return
-    request("/api/quit", {})
+    answered = request("/api/quit", {}) is not None
     end = time.monotonic() + timeout
     while _info() and time.monotonic() < end:
         time.sleep(0.1)
     if _info():  # it does not answer: dismiss it, and give it a moment to notice
         _forget()
         time.sleep(1.5)
+    elif answered and info.get("pid") and info["pid"] != os.getpid():  # (in tests it is a thread)
+        engine.wait_exit(info["pid"], closing)
